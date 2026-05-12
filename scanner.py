@@ -42,7 +42,8 @@ MARKETS_CACHE_TTL   = 3600      # 合约列表缓存 1 小时
 # --- 枢轴与背离参数 ---
 F_PL = 5;   F_PR = 3;   F_MB = 8;   F_MD = 3.0
 M_PL = 10;  M_PR = 6;   M_MB = 20;  M_MD = 3.0
-HOLD_BARS = 8
+HOLD_BARS  = 8    # 兼容字段：仅用于双背离共振的"窗口对齐"判断
+FRESH_BARS = 2    # 信号新鲜度：背离确认后，N 根 K 线内推送，超过则作废
 
 # --- 去重持久化文件 ---
 SENT_SIGNALS_FILE = "sent_signals.json"
@@ -217,7 +218,17 @@ def detect_pivots(series_values, left, right):
 
 
 def detect_divergence_signals(df, symbol, timeframe):
-    """背离检测 + 双背离共振，返回 (msg, sig_type) 列表"""
+    """
+    背离检测 + 双背离共振。
+    返回 [(sig_type, msg, pivot_bar_time_ms), ...]
+
+    关键语义：
+    - 每次背离"确认"发生在第 i 根 K 线（右侧枢轴形成的那根），
+      确认时间 = df['time'].iloc[i]
+    - 只有当 i >= n - 1 - FRESH_BARS，即背离在最近 FRESH_BARS+1 根以内才上报
+    - 去重 key 使用 (symbol, tf, sig_type, 枢轴那根的时间戳)，
+      同一背离事件永远只推一次
+    """
     out = []
     n = len(df)
     if n < 100:
@@ -227,6 +238,7 @@ def detect_divergence_signals(df, symbol, timeframe):
     mf_arr     = df['mf'].values
     high_arr   = df['high'].values
     low_arr    = df['low'].values
+    time_arr   = df['time'].values
 
     f_ph_vals, f_pl_vals = detect_pivots(fusion_arr, F_PL, F_PR)
     m_ph_vals, m_pl_vals = detect_pivots(mf_arr, M_PL, M_PR)
@@ -236,9 +248,8 @@ def detect_divergence_signals(df, symbol, timeframe):
     mh_v = mh_p = mh_b = np.nan
     ml_v = ml_p = ml_b = np.nan
 
-    f_bull = f_bear = m_bull = m_bear = False
-    f_bl = f_bh = m_bl = m_bh = 0
-    f_bull_sig = f_bear_sig = m_bull_sig = m_bear_sig = False
+    # 每种背离记录最近一次"确认时的 bar 索引"
+    last = {"F_BULL": -1, "F_BEAR": -1, "M_BULL": -1, "M_BEAR": -1}
 
     start = max(F_PL, F_PR, M_PL, M_PR) + 20
 
@@ -250,7 +261,7 @@ def detect_divergence_signals(df, symbol, timeframe):
             pp = high_arr[pb] if pb >= 0 else high_arr[i]
             if not np.isnan(fh_v) and not np.isnan(fh_b):
                 if pp >= fh_p and (fh_v - pv) >= F_MD and (pb - fh_b) >= F_MB:
-                    f_bear = True
+                    last["F_BEAR"] = i
             fh_v, fh_p, fh_b = pv, pp, pb
 
         # ── Quantum 底背离 ──
@@ -260,7 +271,7 @@ def detect_divergence_signals(df, symbol, timeframe):
             pp = low_arr[pb] if pb >= 0 else low_arr[i]
             if not np.isnan(fl_v) and not np.isnan(fl_b):
                 if pp <= fl_p and (pv - fl_v) >= F_MD and (pb - fl_b) >= F_MB:
-                    f_bull = True
+                    last["F_BULL"] = i
             fl_v, fl_p, fl_b = pv, pp, pb
 
         # ── Flow 顶背离 ──
@@ -274,7 +285,7 @@ def detect_divergence_signals(df, symbol, timeframe):
             if pp >= ll + (hh - ll) * 0.5:
                 if not np.isnan(mh_v) and not np.isnan(mh_b):
                     if pp >= mh_p and (mh_v - pv) >= M_MD and (pb - mh_b) >= M_MB:
-                        m_bear = True
+                        last["M_BEAR"] = i
             mh_v, mh_p, mh_b = pv, pp, pb
 
         # ── Flow 底背离 ──
@@ -288,73 +299,96 @@ def detect_divergence_signals(df, symbol, timeframe):
             if pp <= ll + (hh - ll) * 0.5:
                 if not np.isnan(ml_v) and not np.isnan(ml_b):
                     if pp <= ml_p and (pv - ml_v) >= M_MD and (pb - ml_b) >= M_MB:
-                        m_bull = True
+                        last["M_BULL"] = i
             ml_v, ml_p, ml_b = pv, pp, pb
 
-        # ── 信号保持窗口 ──
-        f_bh = HOLD_BARS if f_bear else max(0, f_bh - 1)
-        f_bl = HOLD_BARS if f_bull else max(0, f_bl - 1)
-        m_bh = HOLD_BARS if m_bear else max(0, m_bh - 1)
-        m_bl = HOLD_BARS if m_bull else max(0, m_bl - 1)
+    # --- 只保留"最近 FRESH_BARS 根内确认"的信号 ---
+    last_idx = n - 1
+    def fresh(key):
+        idx = last[key]
+        return idx >= 0 and (last_idx - idx) <= FRESH_BARS
 
-        if i == n - 1:
-            f_bull_sig = f_bl > 0
-            f_bear_sig = f_bh > 0
-            m_bull_sig = m_bl > 0
-            m_bear_sig = m_bh > 0
+    f_bull_sig = fresh("F_BULL")
+    f_bear_sig = fresh("F_BEAR")
+    m_bull_sig = fresh("M_BULL")
+    m_bear_sig = fresh("M_BEAR")
 
-        f_bear = f_bull = m_bear = m_bull = False
+    # 共振：两类都新鲜，且确认时间相距 <= HOLD_BARS（允许小时间差）
+    def co_fresh(a, b):
+        ia, ib = last[a], last[b]
+        return (fresh(a) and fresh(b) and abs(ia - ib) <= HOLD_BARS)
 
-    curr_f    = df['fusion_d'].iloc[-1]
-    curr_mf   = df['mf'].iloc[-1]
-    curr_p    = df['close'].iloc[-1]
-    bar_time  = int(df['time'].iloc[-1])
-    bar_str   = datetime.fromtimestamp(bar_time / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    dbl_bull = co_fresh("F_BULL", "M_BULL")
+    dbl_bear = co_fresh("F_BEAR", "M_BEAR")
 
-    dbl_bull = (f_bl > 0 and m_bl > 0)
-    dbl_bear = (f_bh > 0 and m_bh > 0)
+    curr_f   = df['fusion_d'].iloc[-1]
+    curr_mf  = df['mf'].iloc[-1]
+    curr_p   = df['close'].iloc[-1]
+
+    def _age(idx):
+        """返回背离距今几根 K 线"""
+        return last_idx - idx
+
+    def _pivot_time_ms(idx):
+        return int(time_arr[idx])
+
+    def _bar_str(idx):
+        return datetime.fromtimestamp(_pivot_time_ms(idx) / 1000, tz=timezone.utc) \
+                       .strftime('%Y-%m-%d %H:%M UTC')
 
     if dbl_bull:
+        # 用较新的那根作为锚定
+        idx = max(last["F_BULL"], last["M_BULL"])
         out.append(("DBL_BULL",
             f"[UP x2] <b>{symbol} [{timeframe}] 双底背离共振</b>\n"
-            f"Quantum + Flow 同时底背离\n"
+            f"Quantum + Flow 同时底背离 | 新鲜度: {_age(idx)}根前\n"
             f"Fusion: {curr_f:.1f} | Flow: {curr_mf:.2f} | 价: {curr_p:.4f}\n"
-            f"K线: {bar_str}"
+            f"确认K线: {_bar_str(idx)}",
+            _pivot_time_ms(idx)
         ))
     if dbl_bear:
+        idx = max(last["F_BEAR"], last["M_BEAR"])
         out.append(("DBL_BEAR",
             f"[DN x2] <b>{symbol} [{timeframe}] 双顶背离共振</b>\n"
-            f"Quantum + Flow 同时顶背离\n"
+            f"Quantum + Flow 同时顶背离 | 新鲜度: {_age(idx)}根前\n"
             f"Fusion: {curr_f:.1f} | Flow: {curr_mf:.2f} | 价: {curr_p:.4f}\n"
-            f"K线: {bar_str}"
+            f"确认K线: {_bar_str(idx)}",
+            _pivot_time_ms(idx)
         ))
     if f_bull_sig and not dbl_bull:
+        idx = last["F_BULL"]
         out.append(("F_BULL",
             f"[UP] <b>{symbol} [{timeframe}] Quantum 底背离</b>\n"
-            f"Fusion: {curr_f:.1f} | 价格新低，指标未新低 | 价: {curr_p:.4f}\n"
-            f"K线: {bar_str}"
+            f"Fusion: {curr_f:.1f} | 新鲜度: {_age(idx)}根前 | 价: {curr_p:.4f}\n"
+            f"确认K线: {_bar_str(idx)}",
+            _pivot_time_ms(idx)
         ))
     if f_bear_sig and not dbl_bear:
+        idx = last["F_BEAR"]
         out.append(("F_BEAR",
             f"[DN] <b>{symbol} [{timeframe}] Quantum 顶背离</b>\n"
-            f"Fusion: {curr_f:.1f} | 价格新高，指标未新高 | 价: {curr_p:.4f}\n"
-            f"K线: {bar_str}"
+            f"Fusion: {curr_f:.1f} | 新鲜度: {_age(idx)}根前 | 价: {curr_p:.4f}\n"
+            f"确认K线: {_bar_str(idx)}",
+            _pivot_time_ms(idx)
         ))
     if m_bull_sig and not dbl_bull:
+        idx = last["M_BULL"]
         out.append(("M_BULL",
             f"[UP] <b>{symbol} [{timeframe}] Flow 底背离</b>\n"
-            f"Flow: {curr_mf:.2f} | 价格新低，柱状线未新低 | 价: {curr_p:.4f}\n"
-            f"K线: {bar_str}"
+            f"Flow: {curr_mf:.2f} | 新鲜度: {_age(idx)}根前 | 价: {curr_p:.4f}\n"
+            f"确认K线: {_bar_str(idx)}",
+            _pivot_time_ms(idx)
         ))
     if m_bear_sig and not dbl_bear:
+        idx = last["M_BEAR"]
         out.append(("M_BEAR",
             f"[DN] <b>{symbol} [{timeframe}] Flow 顶背离</b>\n"
-            f"Flow: {curr_mf:.2f} | 价格新高，柱状线未新高 | 价: {curr_p:.4f}\n"
-            f"K线: {bar_str}"
+            f"Flow: {curr_mf:.2f} | 新鲜度: {_age(idx)}根前 | 价: {curr_p:.4f}\n"
+            f"确认K线: {_bar_str(idx)}",
+            _pivot_time_ms(idx)
         ))
 
-    # 附带 K 线时间戳，供去重登记
-    return [(sig_type, msg, bar_time) for (sig_type, msg) in out]
+    return out
 
 
 # ==============================================================================
