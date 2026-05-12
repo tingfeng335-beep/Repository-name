@@ -50,7 +50,7 @@ SCAN_WORKERS        = 10        # 并发线程数（Binance 限速建议不超�
 F_PL = 5;   F_PR = 3;   F_MB = 8;   F_MD = 3.0
 M_PL = 10;  M_PR = 6;   M_MB = 20;  M_MD = 3.0
 HOLD_BARS  = 8    # 双背离共振：两类确认时间差窗口
-FRESH_BARS = 2    # 信号新鲜度：允许 0~N 根前的信号（N=2 即最多 2 根前）
+FRESH_BARS = 3    # 信号新鲜度：允许 0~N 根前的信号（N=3 即最多 3 根前）
 
 # --- 持久化文件 ---
 SENT_SIGNALS_FILE  = "sent_signals.json"
