@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quantum Flow 背离侦察系统 v2
+Quantum Flow 背离侦察系统 v3
 - 按 Binance USDT 永续合约 24h 成交额降序取前 TOP_N 个扫描
 - 严格排除交割合约、USDC 计价合约
 - 并发扫描（线程池），单周期扫描提速 3~5 倍
@@ -8,6 +8,8 @@ Quantum Flow 背离侦察系统 v2
 - 信号带强度分 (★ 1~5) + 结构化日志 signals.log
 - 丢弃未收盘 K 线，防止信号闪烁
 - 主循环顶层异常保护，7x24 不挂
+- v3 新增: 失败合约自动退避（三振出局，冷藏 1 小时）
+- v3 新增: 分周期独立 FRESH_BARS 配置
 """
 
 import ccxt
@@ -50,7 +52,19 @@ SCAN_WORKERS        = 10        # 并发线程数（Binance 限速建议不超�
 F_PL = 5;   F_PR = 3;   F_MB = 8;   F_MD = 3.0
 M_PL = 10;  M_PR = 6;   M_MB = 20;  M_MD = 3.0
 HOLD_BARS  = 8    # 双背离共振：两类确认时间差窗口
-FRESH_BARS = 3    # 信号新鲜度：允许 0~N 根前的信号（N=3 即最多 3 根前）
+
+# --- 分周期新鲜度：允许 0~N 根前的信号推送 ---
+# 15m/1h 给 3 根（约 45 分钟 / 3 小时），4h 给 2 根（约 8 小时），避免过时
+FRESH_BARS_MAP = {
+    "15m": 3,
+    "1h":  3,
+    "4h":  2,
+}
+FRESH_BARS_DEFAULT = 3
+
+# --- 失败合约退避 ---
+FAIL_STRIKE_LIMIT = 3             # 连续失败多少次进入冷藏
+COOLDOWN_SECONDS  = 60 * 60       # 冷藏时长（秒）= 1 小时
 
 # --- 持久化文件 ---
 SENT_SIGNALS_FILE  = "sent_signals.json"
@@ -159,7 +173,45 @@ def should_send(symbol, tf, sig_type, bar_time_ms):
 
 
 # ==============================================================================
-# 4. 【结构化日志】
+# 4. 【失败合约退避】
+# ==============================================================================
+
+_strike_lock = threading.Lock()
+# key: (symbol, timeframe) -> {"fails": 连续失败次数, "cold_until": 解冻时间戳}
+_symbol_strikes = {}
+
+
+def is_cold(symbol, tf):
+    """检查合约是否处于冷藏期"""
+    with _strike_lock:
+        rec = _symbol_strikes.get((symbol, tf))
+        if not rec:
+            return False
+        return rec.get("cold_until", 0) > time.time()
+
+
+def record_success(symbol, tf):
+    """成功后清除连续失败计数"""
+    with _strike_lock:
+        _symbol_strikes.pop((symbol, tf), None)
+
+
+def record_failure(symbol, tf):
+    """记录一次失败；达到阈值则冷藏"""
+    with _strike_lock:
+        rec = _symbol_strikes.get((symbol, tf), {"fails": 0, "cold_until": 0})
+        rec["fails"] += 1
+        if rec["fails"] >= FAIL_STRIKE_LIMIT:
+            rec["cold_until"] = time.time() + COOLDOWN_SECONDS
+            rec["fails"] = 0
+            _symbol_strikes[(symbol, tf)] = rec
+            return True   # 触发冷藏
+        _symbol_strikes[(symbol, tf)] = rec
+        return False
+
+
+# ==============================================================================
+# 5. 【结构化日志】
 # ==============================================================================
 
 _log_lock = threading.Lock()
@@ -187,7 +239,7 @@ def log_signal(row):
 
 
 # ==============================================================================
-# 5. 【核心指标算法】
+# 6. 【核心指标算法】
 # ==============================================================================
 
 def calculate_quantum_flow(df):
@@ -301,7 +353,11 @@ def detect_divergence_signals(df, symbol, timeframe):
     """
     背离检测 + 双背离共振。
     返回 [(sig_type, msg, pivot_bar_time_ms, log_row), ...]
+
+    FRESH_BARS 按周期查表（FRESH_BARS_MAP），默认 FRESH_BARS_DEFAULT。
     """
+    fresh_bars = FRESH_BARS_MAP.get(timeframe, FRESH_BARS_DEFAULT)
+
     out = []
     n = len(df)
     if n < 100:
@@ -384,12 +440,12 @@ def detect_divergence_signals(df, symbol, timeframe):
                         last["M_BULL"] = {"idx": i, "amp": amp}
             ml_v, ml_p, ml_b = pv, pp, pb
 
-    # --- 只保留"最近 FRESH_BARS 根内确认"的信号 ---
+    # --- 只保留"最近 fresh_bars 根内确认"的信号 ---
     last_idx = n - 1
 
     def fresh(key):
         idx = last[key]["idx"]
-        return idx >= 0 and (last_idx - idx) <= FRESH_BARS
+        return idx >= 0 and (last_idx - idx) <= fresh_bars
 
     def co_fresh(a, b):
         ia, ib = last[a]["idx"], last[b]["idx"]
@@ -480,7 +536,7 @@ def detect_divergence_signals(df, symbol, timeframe):
 
 
 # ==============================================================================
-# 6. 【合约池】
+# 7. 【合约池】
 # ==============================================================================
 
 _markets_cache = {"time": 0, "symbols": []}
@@ -525,7 +581,7 @@ def get_top_symbols(exchange, top_n=TOP_N, ttl=MARKETS_CACHE_TTL):
 
 
 # ==============================================================================
-# 7. 【侦察引擎：并发】
+# 8. 【侦察引擎：并发 + 失败退避】
 # ==============================================================================
 
 def _scan_one(exchange, symbol, timeframe):
@@ -552,16 +608,25 @@ def _scan_one(exchange, symbol, timeframe):
 
 
 def scan_markets(exchange, timeframe):
-    """并发扫描 Top N 合约"""
+    """并发扫描 Top N 合约（带失败退避）"""
     t0 = time.time()
     try:
-        symbols = get_top_symbols(exchange)
-        total = len(symbols)
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [SCAN] 周期:{timeframe} | 合约:{total} | 并发:{SCAN_WORKERS}")
+        all_symbols = get_top_symbols(exchange)
 
-        alert_count = 0
-        done_count  = 0
-        tg_logs     = []
+        # 过滤出未冷藏的合约
+        symbols = [s for s in all_symbols if not is_cold(s, timeframe)]
+        skipped_cold = len(all_symbols) - len(symbols)
+
+        total = len(symbols)
+        fresh_bars = FRESH_BARS_MAP.get(timeframe, FRESH_BARS_DEFAULT)
+        extra = f" | 冷藏跳过:{skipped_cold}" if skipped_cold else ""
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [SCAN] 周期:{timeframe} | "
+              f"合约:{total} | 并发:{SCAN_WORKERS} | 新鲜度≤{fresh_bars}{extra}")
+
+        alert_count  = 0
+        done_count   = 0
+        cold_count   = 0    # 本轮新增冷藏的合约数
+        tg_logs      = []
 
         with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
             future_map = {pool.submit(_scan_one, exchange, s, timeframe): s for s in symbols}
@@ -571,6 +636,7 @@ def scan_markets(exchange, timeframe):
                 done_count += 1
                 try:
                     _, signals = fut.result()
+                    record_success(sym, timeframe)
                     for sig_type, msg, _bt, log_row in signals:
                         ok = send_tg(msg)
                         log_signal(log_row)
@@ -578,10 +644,15 @@ def scan_markets(exchange, timeframe):
                         tag = 'OK' if ok else 'FAIL'
                         tg_logs.append(f"  [{tag}] {sym} {sig_type} {_stars_str(log_row['stars'])}")
                 except Exception as e:
-                    tg_logs.append(f"  [SKIP] {sym}: {type(e).__name__}")
+                    triggered = record_failure(sym, timeframe)
+                    if triggered:
+                        cold_count += 1
+                        tg_logs.append(f"  [COLD] {sym}: 连续失败，冷藏 1 小时 ({type(e).__name__})")
+                    else:
+                        tg_logs.append(f"  [SKIP] {sym}: {type(e).__name__}")
 
                 # 进度条
-                pct = done_count / total * 100
+                pct = done_count / total * 100 if total > 0 else 100
                 sys.stdout.write(
                     f"\r[{timeframe}] {pct:5.1f}% | {done_count:>3}/{total} | 警报:{alert_count}   "
                 )
@@ -589,7 +660,10 @@ def scan_markets(exchange, timeframe):
 
         sys.stdout.write("\n")
         elapsed = time.time() - t0
-        print(f"[{timeframe}] 巡逻完毕 | 耗时 {elapsed:.1f}s | 新增信号 {alert_count} 个")
+        summary = f"耗时 {elapsed:.1f}s | 新增信号 {alert_count} 个"
+        if cold_count:
+            summary += f" | 新冷藏 {cold_count} 个"
+        print(f"[{timeframe}] 巡逻完毕 | {summary}")
         for line in tg_logs[-30:]:
             print(line)
 
@@ -600,7 +674,7 @@ def scan_markets(exchange, timeframe):
 
 
 # ==============================================================================
-# 8. 【主循环】
+# 9. 【主循环】
 # ==============================================================================
 
 def main():
@@ -614,13 +688,16 @@ def main():
     print("[OK] 交易所初始化完成")
 
     print("[INIT] 发送启动宣告至 Telegram...")
+    fresh_desc = " / ".join(f"{tf}:{FRESH_BARS_MAP.get(tf, FRESH_BARS_DEFAULT)}根"
+                            for tf in (t["timeframe"] for t in SCAN_TASKS))
     send_tg(
-        f"<b>Quantum Flow 背离侦察系统 v2 启动</b>\n"
+        f"<b>Quantum Flow 背离侦察系统 v3 启动</b>\n"
         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"监控周期: 15m / 1h / 4h\n"
         f"合约池: Binance USDT 永续 Top {TOP_N} (按 24h 成交额)\n"
         f"并发扫描: {SCAN_WORKERS} 线程\n"
-        f"新鲜度: {FRESH_BARS} 根 K 内\n"
+        f"新鲜度: {fresh_desc}\n"
+        f"失败退避: 连续 {FAIL_STRIKE_LIMIT} 次 → 冷藏 {COOLDOWN_SECONDS // 60} 分钟\n"
         f"信号: Quantum/Flow/双背离共振 (带强度星级)\n"
         f"状态: 全市场扫描中..."
     )
@@ -628,7 +705,7 @@ def main():
     last_run_times = {task['timeframe']: 0 for task in SCAN_TASKS}
 
     print("\n" + "=" * 60)
-    print("  Quantum Flow 背离侦察系统 v2 部署成功")
+    print("  Quantum Flow 背离侦察系统 v3 部署成功")
     print("=" * 60 + "\n")
 
     while True:
