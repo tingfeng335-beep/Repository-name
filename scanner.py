@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Quantum Flow 背离侦察系统
-- 每个时间周期按 Binance USDT 永续合约 24h 成交额降序取前 N 个扫描
+Quantum Flow 背离侦察系统 v2
+- 按 Binance USDT 永续合约 24h 成交额降序取前 TOP_N 个扫描
 - 严格排除交割合约、USDC 计价合约
-- 信号带去重（持久化），避免刷屏
+- 并发扫描（线程池），单周期扫描提速 3~5 倍
+- 信号持久化去重 + 3 天自动清理过期记录
+- 信号带强度分 (★ 1~5) + 结构化日志 signals.log
 - 丢弃未收盘 K 线，防止信号闪烁
-- 主循环有顶层异常保护，7x24 不挂
+- 主循环顶层异常保护，7x24 不挂
 """
 
 import ccxt
@@ -17,6 +19,8 @@ import os
 import sys
 import json
 import atexit
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 # ==============================================================================
@@ -36,18 +40,24 @@ SCAN_TASKS = [
 ]
 
 # --- 合约池设置：按 24h 成交额降序取前 TOP_N 个 ---
-TOP_N               = 180
+TOP_N               = 200
 MARKETS_CACHE_TTL   = 3600      # 合约列表缓存 1 小时
+
+# --- 并发设置 ---
+SCAN_WORKERS        = 10        # 并发线程数（Binance 限速建议不超过 20）
 
 # --- 枢轴与背离参数 ---
 F_PL = 5;   F_PR = 3;   F_MB = 8;   F_MD = 3.0
 M_PL = 10;  M_PR = 6;   M_MB = 20;  M_MD = 3.0
-HOLD_BARS  = 8    # 兼容字段：仅用于双背离共振的"窗口对齐"判断
-FRESH_BARS = 2    # 信号新鲜度：背离确认后，N 根 K 线内推送，超过则作废
+HOLD_BARS  = 8    # 双背离共振：两类确认时间差窗口
+FRESH_BARS = 3    # 信号新鲜度：背离确认后，N 根 K 线内推送，超过则作废
 
-# --- 去重持久化文件 ---
-SENT_SIGNALS_FILE = "sent_signals.json"
+# --- 持久化文件 ---
+SENT_SIGNALS_FILE  = "sent_signals.json"
+SIGNALS_LOG_FILE   = "signals.log"
 
+# --- 去重记录保留时长（毫秒） ---
+SIGNAL_RETENTION_MS = 3 * 24 * 3600 * 1000    # 3 天
 
 # ==============================================================================
 # 2. 【通讯模块】
@@ -56,61 +66,78 @@ SENT_SIGNALS_FILE = "sent_signals.json"
 # 禁用系统代理，避免 Windows 代理设置导致 requests 卡死
 _NO_PROXY = {"http": None, "https": None}
 
+_tg_lock = threading.Lock()   # 并发环境下串行化 TG 发送，避免触发 429
+
 
 def send_tg(message, retries=3):
-    """发送战报至 Telegram，失败指数退避重试"""
+    """发送战报至 Telegram，失败指数退避重试（线程安全）"""
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
 
-    for attempt in range(retries):
-        try:
-            resp = requests.post(
-                url, json=payload,
-                timeout=(3, 5),
-                proxies=_NO_PROXY
-            )
-            result = resp.json()
-            if result.get("ok"):
-                return True
-            # Telegram 返回错误
-            desc = result.get("description", "")
-            if "Too Many Requests" in desc and attempt < retries - 1:
-                retry_after = result.get("parameters", {}).get("retry_after", 2 ** attempt)
-                time.sleep(retry_after)
-                continue
-            print(f"  [WARN] TG 返回错误: {desc}")
-            return False
-        except (requests.exceptions.ConnectTimeout,
-                requests.exceptions.ReadTimeout,
-                requests.exceptions.ConnectionError) as e:
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)   # 1s, 2s, 4s
-                continue
-            print(f"  [WARN] TG 最终失败: {type(e).__name__}: {e}")
-            return False
-        except Exception as e:
-            print(f"  [WARN] TG 发送异常: {type(e).__name__}: {e}")
-            return False
-    return False
+    with _tg_lock:
+        for attempt in range(retries):
+            try:
+                resp = requests.post(
+                    url, json=payload,
+                    timeout=(3, 5),
+                    proxies=_NO_PROXY
+                )
+                result = resp.json()
+                if result.get("ok"):
+                    return True
+                desc = result.get("description", "")
+                if "Too Many Requests" in desc and attempt < retries - 1:
+                    retry_after = result.get("parameters", {}).get("retry_after", 2 ** attempt)
+                    time.sleep(retry_after)
+                    continue
+                print(f"  [WARN] TG 返回错误: {desc}")
+                return False
+            except (requests.exceptions.ConnectTimeout,
+                    requests.exceptions.ReadTimeout,
+                    requests.exceptions.ConnectionError) as e:
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                print(f"  [WARN] TG 最终失败: {type(e).__name__}: {e}")
+                return False
+            except Exception as e:
+                print(f"  [WARN] TG 发送异常: {type(e).__name__}: {e}")
+                return False
+        return False
 
 
 # ==============================================================================
-# 3. 【去重缓存：持久化】
+# 3. 【去重缓存：持久化 + 自动清理过期】
 # ==============================================================================
+
+_sent_lock = threading.Lock()
+
 
 def _load_sent_signals():
+    """加载并清理过期记录（> SIGNAL_RETENTION_MS）"""
     try:
         with open(SENT_SIGNALS_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
-        # 反序列化：字符串 key "symbol|tf|type" -> tuple
-        return {tuple(k.split("|", 2)): v for k, v in raw.items()}
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+
+    cutoff = int(time.time() * 1000) - SIGNAL_RETENTION_MS
+    clean = {}
+    dropped = 0
+    for k, v in raw.items():
+        if isinstance(v, (int, float)) and v > cutoff:
+            clean[tuple(k.split("|", 2))] = v
+        else:
+            dropped += 1
+    if dropped:
+        print(f"  [INFO] 去重缓存清理: 丢弃 {dropped} 条过期记录, 保留 {len(clean)} 条")
+    return clean
 
 
 def _save_sent_signals():
     try:
-        serializable = {"|".join(k): v for k, v in sent_signals.items()}
+        with _sent_lock:
+            serializable = {"|".join(k): v for k, v in sent_signals.items()}
         with open(SENT_SIGNALS_FILE, "w", encoding="utf-8") as f:
             json.dump(serializable, f, ensure_ascii=False, indent=2)
     except Exception as e:
@@ -122,16 +149,45 @@ atexit.register(_save_sent_signals)
 
 
 def should_send(symbol, tf, sig_type, bar_time_ms):
-    """若该信号（同 K 线）已发送过，返回 False；否则登记并返回 True"""
+    """若该信号（同一背离确认 K 线）已发送过，返回 False；否则登记并返回 True"""
     key = (symbol, tf, sig_type)
-    if sent_signals.get(key) == bar_time_ms:
-        return False
-    sent_signals[key] = bar_time_ms
+    with _sent_lock:
+        if sent_signals.get(key) == bar_time_ms:
+            return False
+        sent_signals[key] = bar_time_ms
     return True
 
 
 # ==============================================================================
-# 4. 【核心指标算法】
+# 4. 【结构化日志】
+# ==============================================================================
+
+_log_lock = threading.Lock()
+
+
+def log_signal(row):
+    """把信号写入 CSV 格式日志，方便后续统计胜率"""
+    header = "time_utc,symbol,timeframe,sig_type,strength_stars,strength_ratio,price,fusion,flow,age_bars,bar_utc\n"
+    line = (
+        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')},"
+        f"{row['symbol']},{row['tf']},{row['sig_type']},"
+        f"{row['stars']},{row['ratio']:.2f},"
+        f"{row['price']:.6f},{row['fusion']:.2f},{row['flow']:.2f},"
+        f"{row['age']},{row['bar_utc']}\n"
+    )
+    try:
+        with _log_lock:
+            exists = os.path.exists(SIGNALS_LOG_FILE)
+            with open(SIGNALS_LOG_FILE, "a", encoding="utf-8") as f:
+                if not exists:
+                    f.write(header)
+                f.write(line)
+    except Exception as e:
+        print(f"  [WARN] 日志写入失败: {e}")
+
+
+# ==============================================================================
+# 5. 【核心指标算法】
 # ==============================================================================
 
 def calculate_quantum_flow(df):
@@ -196,7 +252,7 @@ def calculate_quantum_flow(df):
 def detect_pivots(series_values, left, right):
     """
     检测枢轴高低点（左严格 > / 右 >=；左严格 < / 右 <=），
-    贴近 TradingView ta.pivothigh/pivotlow 的常见实现，平台期不重复出枢轴。
+    贴近 TradingView ta.pivothigh/pivotlow 的常见实现。
     """
     n = len(series_values)
     ph_vals = [np.nan] * n
@@ -217,17 +273,34 @@ def detect_pivots(series_values, left, right):
     return ph_vals, pl_vals
 
 
+def _strength_stars(ratio):
+    """
+    根据"实际幅度 / 阈值"的比率映射成 1~5 星
+    1.0x -> ★
+    1.5x -> ★★
+    2.0x -> ★★★
+    3.0x -> ★★★★
+    >=5x -> ★★★★★
+    """
+    if ratio >= 5.0:
+        return 5
+    if ratio >= 3.0:
+        return 4
+    if ratio >= 2.0:
+        return 3
+    if ratio >= 1.5:
+        return 2
+    return 1
+
+
+def _stars_str(n):
+    return "★" * n + "☆" * (5 - n)
+
+
 def detect_divergence_signals(df, symbol, timeframe):
     """
     背离检测 + 双背离共振。
-    返回 [(sig_type, msg, pivot_bar_time_ms), ...]
-
-    关键语义：
-    - 每次背离"确认"发生在第 i 根 K 线（右侧枢轴形成的那根），
-      确认时间 = df['time'].iloc[i]
-    - 只有当 i >= n - 1 - FRESH_BARS，即背离在最近 FRESH_BARS+1 根以内才上报
-    - 去重 key 使用 (symbol, tf, sig_type, 枢轴那根的时间戳)，
-      同一背离事件永远只推一次
+    返回 [(sig_type, msg, pivot_bar_time_ms, log_row), ...]
     """
     out = []
     n = len(df)
@@ -248,8 +321,13 @@ def detect_divergence_signals(df, symbol, timeframe):
     mh_v = mh_p = mh_b = np.nan
     ml_v = ml_p = ml_b = np.nan
 
-    # 每种背离记录最近一次"确认时的 bar 索引"
-    last = {"F_BULL": -1, "F_BEAR": -1, "M_BULL": -1, "M_BEAR": -1}
+    # 每种背离记录最近一次"确认索引 + 背离幅度"
+    last = {
+        "F_BULL": {"idx": -1, "amp": 0.0},
+        "F_BEAR": {"idx": -1, "amp": 0.0},
+        "M_BULL": {"idx": -1, "amp": 0.0},
+        "M_BEAR": {"idx": -1, "amp": 0.0},
+    }
 
     start = max(F_PL, F_PR, M_PL, M_PR) + 20
 
@@ -260,8 +338,9 @@ def detect_divergence_signals(df, symbol, timeframe):
             pv = f_ph_vals[i]
             pp = high_arr[pb] if pb >= 0 else high_arr[i]
             if not np.isnan(fh_v) and not np.isnan(fh_b):
-                if pp >= fh_p and (fh_v - pv) >= F_MD and (pb - fh_b) >= F_MB:
-                    last["F_BEAR"] = i
+                amp = fh_v - pv
+                if pp >= fh_p and amp >= F_MD and (pb - fh_b) >= F_MB:
+                    last["F_BEAR"] = {"idx": i, "amp": amp}
             fh_v, fh_p, fh_b = pv, pp, pb
 
         # ── Quantum 底背离 ──
@@ -270,8 +349,9 @@ def detect_divergence_signals(df, symbol, timeframe):
             pv = f_pl_vals[i]
             pp = low_arr[pb] if pb >= 0 else low_arr[i]
             if not np.isnan(fl_v) and not np.isnan(fl_b):
-                if pp <= fl_p and (pv - fl_v) >= F_MD and (pb - fl_b) >= F_MB:
-                    last["F_BULL"] = i
+                amp = pv - fl_v
+                if pp <= fl_p and amp >= F_MD and (pb - fl_b) >= F_MB:
+                    last["F_BULL"] = {"idx": i, "amp": amp}
             fl_v, fl_p, fl_b = pv, pp, pb
 
         # ── Flow 顶背离 ──
@@ -284,8 +364,9 @@ def detect_divergence_signals(df, symbol, timeframe):
             ll = low_arr[max(0, i - lookback):i + 1].min()
             if pp >= ll + (hh - ll) * 0.5:
                 if not np.isnan(mh_v) and not np.isnan(mh_b):
-                    if pp >= mh_p and (mh_v - pv) >= M_MD and (pb - mh_b) >= M_MB:
-                        last["M_BEAR"] = i
+                    amp = mh_v - pv
+                    if pp >= mh_p and amp >= M_MD and (pb - mh_b) >= M_MB:
+                        last["M_BEAR"] = {"idx": i, "amp": amp}
             mh_v, mh_p, mh_b = pv, pp, pb
 
         # ── Flow 底背离 ──
@@ -298,35 +379,35 @@ def detect_divergence_signals(df, symbol, timeframe):
             ll = low_arr[max(0, i - lookback):i + 1].min()
             if pp <= ll + (hh - ll) * 0.5:
                 if not np.isnan(ml_v) and not np.isnan(ml_b):
-                    if pp <= ml_p and (pv - ml_v) >= M_MD and (pb - ml_b) >= M_MB:
-                        last["M_BULL"] = i
+                    amp = pv - ml_v
+                    if pp <= ml_p and amp >= M_MD and (pb - ml_b) >= M_MB:
+                        last["M_BULL"] = {"idx": i, "amp": amp}
             ml_v, ml_p, ml_b = pv, pp, pb
 
     # --- 只保留"最近 FRESH_BARS 根内确认"的信号 ---
     last_idx = n - 1
+
     def fresh(key):
-        idx = last[key]
+        idx = last[key]["idx"]
         return idx >= 0 and (last_idx - idx) <= FRESH_BARS
+
+    def co_fresh(a, b):
+        ia, ib = last[a]["idx"], last[b]["idx"]
+        return (fresh(a) and fresh(b) and abs(ia - ib) <= HOLD_BARS)
 
     f_bull_sig = fresh("F_BULL")
     f_bear_sig = fresh("F_BEAR")
     m_bull_sig = fresh("M_BULL")
     m_bear_sig = fresh("M_BEAR")
 
-    # 共振：两类都新鲜，且确认时间相距 <= HOLD_BARS（允许小时间差）
-    def co_fresh(a, b):
-        ia, ib = last[a], last[b]
-        return (fresh(a) and fresh(b) and abs(ia - ib) <= HOLD_BARS)
-
     dbl_bull = co_fresh("F_BULL", "M_BULL")
     dbl_bear = co_fresh("F_BEAR", "M_BEAR")
 
-    curr_f   = df['fusion_d'].iloc[-1]
-    curr_mf  = df['mf'].iloc[-1]
-    curr_p   = df['close'].iloc[-1]
+    curr_f   = float(df['fusion_d'].iloc[-1])
+    curr_mf  = float(df['mf'].iloc[-1])
+    curr_p   = float(df['close'].iloc[-1])
 
     def _age(idx):
-        """返回背离距今几根 K 线"""
         return last_idx - idx
 
     def _pivot_time_ms(idx):
@@ -336,63 +417,70 @@ def detect_divergence_signals(df, symbol, timeframe):
         return datetime.fromtimestamp(_pivot_time_ms(idx) / 1000, tz=timezone.utc) \
                        .strftime('%Y-%m-%d %H:%M UTC')
 
+    def _build(sig_type, title_prefix, title_cn, idx, ratio):
+        stars = _strength_stars(ratio)
+        age   = _age(idx)
+        bar_t = _bar_str(idx)
+        detail_line = {
+            "DBL_BULL": f"Quantum + Flow 同时底背离",
+            "DBL_BEAR": f"Quantum + Flow 同时顶背离",
+            "F_BULL":   f"Fusion: {curr_f:.1f} | 价格新低，Fusion 未新低",
+            "F_BEAR":   f"Fusion: {curr_f:.1f} | 价格新高，Fusion 未新高",
+            "M_BULL":   f"Flow: {curr_mf:.2f} | 价格新低，Flow 未新低",
+            "M_BEAR":   f"Flow: {curr_mf:.2f} | 价格新高，Flow 未新高",
+        }[sig_type]
+
+        msg = (
+            f"{title_prefix} <b>{symbol} [{timeframe}] {title_cn}</b>\n"
+            f"强度: {_stars_str(stars)}  ({ratio:.1f}x 阈值)\n"
+            f"{detail_line}\n"
+            f"新鲜度: {age} 根前 | 价: {curr_p:.6f}\n"
+            f"确认K线: {bar_t}"
+        )
+        log_row = {
+            "symbol": symbol, "tf": timeframe, "sig_type": sig_type,
+            "stars": stars, "ratio": ratio, "price": curr_p,
+            "fusion": curr_f, "flow": curr_mf, "age": age, "bar_utc": bar_t,
+        }
+        return (sig_type, msg, _pivot_time_ms(idx), log_row)
+
     if dbl_bull:
-        # 用较新的那根作为锚定
-        idx = max(last["F_BULL"], last["M_BULL"])
-        out.append(("DBL_BULL",
-            f"[UP x2] <b>{symbol} [{timeframe}] 双底背离共振</b>\n"
-            f"Quantum + Flow 同时底背离 | 新鲜度: {_age(idx)}根前\n"
-            f"Fusion: {curr_f:.1f} | Flow: {curr_mf:.2f} | 价: {curr_p:.4f}\n"
-            f"确认K线: {_bar_str(idx)}",
-            _pivot_time_ms(idx)
-        ))
+        fi = last["F_BULL"]["idx"]; mi = last["M_BULL"]["idx"]
+        idx = max(fi, mi)
+        # 共振强度：取两侧比率的几何均值
+        r_f = last["F_BULL"]["amp"] / F_MD
+        r_m = last["M_BULL"]["amp"] / M_MD
+        ratio = (r_f * r_m) ** 0.5
+        out.append(_build("DBL_BULL", "[UP x2]", "双底背离共振", idx, ratio))
     if dbl_bear:
-        idx = max(last["F_BEAR"], last["M_BEAR"])
-        out.append(("DBL_BEAR",
-            f"[DN x2] <b>{symbol} [{timeframe}] 双顶背离共振</b>\n"
-            f"Quantum + Flow 同时顶背离 | 新鲜度: {_age(idx)}根前\n"
-            f"Fusion: {curr_f:.1f} | Flow: {curr_mf:.2f} | 价: {curr_p:.4f}\n"
-            f"确认K线: {_bar_str(idx)}",
-            _pivot_time_ms(idx)
-        ))
+        fi = last["F_BEAR"]["idx"]; mi = last["M_BEAR"]["idx"]
+        idx = max(fi, mi)
+        r_f = last["F_BEAR"]["amp"] / F_MD
+        r_m = last["M_BEAR"]["amp"] / M_MD
+        ratio = (r_f * r_m) ** 0.5
+        out.append(_build("DBL_BEAR", "[DN x2]", "双顶背离共振", idx, ratio))
     if f_bull_sig and not dbl_bull:
-        idx = last["F_BULL"]
-        out.append(("F_BULL",
-            f"[UP] <b>{symbol} [{timeframe}] Quantum 底背离</b>\n"
-            f"Fusion: {curr_f:.1f} | 新鲜度: {_age(idx)}根前 | 价: {curr_p:.4f}\n"
-            f"确认K线: {_bar_str(idx)}",
-            _pivot_time_ms(idx)
-        ))
+        idx = last["F_BULL"]["idx"]
+        ratio = last["F_BULL"]["amp"] / F_MD
+        out.append(_build("F_BULL", "[UP]", "Quantum 底背离", idx, ratio))
     if f_bear_sig and not dbl_bear:
-        idx = last["F_BEAR"]
-        out.append(("F_BEAR",
-            f"[DN] <b>{symbol} [{timeframe}] Quantum 顶背离</b>\n"
-            f"Fusion: {curr_f:.1f} | 新鲜度: {_age(idx)}根前 | 价: {curr_p:.4f}\n"
-            f"确认K线: {_bar_str(idx)}",
-            _pivot_time_ms(idx)
-        ))
+        idx = last["F_BEAR"]["idx"]
+        ratio = last["F_BEAR"]["amp"] / F_MD
+        out.append(_build("F_BEAR", "[DN]", "Quantum 顶背离", idx, ratio))
     if m_bull_sig and not dbl_bull:
-        idx = last["M_BULL"]
-        out.append(("M_BULL",
-            f"[UP] <b>{symbol} [{timeframe}] Flow 底背离</b>\n"
-            f"Flow: {curr_mf:.2f} | 新鲜度: {_age(idx)}根前 | 价: {curr_p:.4f}\n"
-            f"确认K线: {_bar_str(idx)}",
-            _pivot_time_ms(idx)
-        ))
+        idx = last["M_BULL"]["idx"]
+        ratio = last["M_BULL"]["amp"] / M_MD
+        out.append(_build("M_BULL", "[UP]", "Flow 底背离", idx, ratio))
     if m_bear_sig and not dbl_bear:
-        idx = last["M_BEAR"]
-        out.append(("M_BEAR",
-            f"[DN] <b>{symbol} [{timeframe}] Flow 顶背离</b>\n"
-            f"Flow: {curr_mf:.2f} | 新鲜度: {_age(idx)}根前 | 价: {curr_p:.4f}\n"
-            f"确认K线: {_bar_str(idx)}",
-            _pivot_time_ms(idx)
-        ))
+        idx = last["M_BEAR"]["idx"]
+        ratio = last["M_BEAR"]["amp"] / M_MD
+        out.append(_build("M_BEAR", "[DN]", "Flow 顶背离", idx, ratio))
 
     return out
 
 
 # ==============================================================================
-# 5. 【合约池：永续 + USDT + 24h 成交额 Top N】
+# 6. 【合约池】
 # ==============================================================================
 
 _markets_cache = {"time": 0, "symbols": []}
@@ -406,14 +494,13 @@ def get_top_symbols(exchange, top_n=TOP_N, ttl=MARKETS_CACHE_TTL):
     markets = exchange.fetch_markets()
     eligible = [
         m for m in markets
-        if m.get('swap', False)               # 永续合约
+        if m.get('swap', False)
         and m.get('active', False)
-        and m.get('quote') == 'USDT'          # USDT 计价
-        and not m.get('expiry')               # 排除交割合约
-        and 'USDC' not in m['symbol']         # 排除 USDC 相关
+        and m.get('quote') == 'USDT'
+        and not m.get('expiry')
+        and 'USDC' not in m['symbol']
     ]
 
-    # 用 fetch_tickers 批量拿 24h 成交额
     tickers = exchange.fetch_tickers([m['symbol'] for m in eligible])
 
     def _quote_vol(sym):
@@ -438,56 +525,74 @@ def get_top_symbols(exchange, top_n=TOP_N, ttl=MARKETS_CACHE_TTL):
 
 
 # ==============================================================================
-# 6. 【侦察引擎】
+# 7. 【侦察引擎：并发】
 # ==============================================================================
 
+def _scan_one(exchange, symbol, timeframe):
+    """
+    扫描单个合约，返回 (symbol, signals_to_send) 或抛异常
+    signals_to_send: [(sig_type, msg, bar_time, log_row), ...]
+    已做 should_send 过滤
+    """
+    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
+    if len(bars) < 101:
+        return symbol, []
+
+    df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+    df = df.iloc[:-1].reset_index(drop=True)    # 丢弃未收盘 K 线
+
+    df = calculate_quantum_flow(df)
+    raw = detect_divergence_signals(df, symbol, timeframe)
+
+    to_send = []
+    for sig_type, msg, bar_time, log_row in raw:
+        if should_send(symbol, timeframe, sig_type, bar_time):
+            to_send.append((sig_type, msg, bar_time, log_row))
+    return symbol, to_send
+
+
 def scan_markets(exchange, timeframe):
-    """对 Top N 合约按指定周期扫描背离信号"""
+    """并发扫描 Top N 合约"""
+    t0 = time.time()
     try:
         symbols = get_top_symbols(exchange)
         total = len(symbols)
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [SCAN] 周期:{timeframe} | 合约数:{total}")
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [SCAN] 周期:{timeframe} | 合约:{total} | 并发:{SCAN_WORKERS}")
 
         alert_count = 0
-        tg_logs = []   # 暂存发送结果，最后统一打印，避免打乱进度条
+        done_count  = 0
+        tg_logs     = []
 
-        for index, symbol in enumerate(symbols):
-            try:
-                percent = (index + 1) / total * 100
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+            future_map = {pool.submit(_scan_one, exchange, s, timeframe): s for s in symbols}
+
+            for fut in as_completed(future_map):
+                sym = future_map[fut]
+                done_count += 1
+                try:
+                    _, signals = fut.result()
+                    for sig_type, msg, _bt, log_row in signals:
+                        ok = send_tg(msg)
+                        log_signal(log_row)
+                        alert_count += 1
+                        tag = 'OK' if ok else 'FAIL'
+                        tg_logs.append(f"  [{tag}] {sym} {sig_type} {_stars_str(log_row['stars'])}")
+                except Exception as e:
+                    tg_logs.append(f"  [SKIP] {sym}: {type(e).__name__}")
+
+                # 进度条
+                pct = done_count / total * 100
                 sys.stdout.write(
-                    f"\r[{timeframe}] {percent:5.1f}% | {index + 1:>3}/{total}"
-                    f" | {symbol:<20} | 警报:{alert_count}    "
+                    f"\r[{timeframe}] {pct:5.1f}% | {done_count:>3}/{total} | 警报:{alert_count}   "
                 )
                 sys.stdout.flush()
 
-                bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
-                if len(bars) < 101:   # 丢掉最后一根未收盘 K 线后仍需 >=100 根
-                    continue
-
-                df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
-                df = df.iloc[:-1].reset_index(drop=True)   # 丢弃未收盘 K 线
-
-                df = calculate_quantum_flow(df)
-                signals = detect_divergence_signals(df, symbol, timeframe)
-
-                for sig_type, msg, bar_time in signals:
-                    if not should_send(symbol, timeframe, sig_type, bar_time):
-                        continue
-                    ok = send_tg(msg)
-                    alert_count += 1
-                    tg_logs.append(f"  [{'OK' if ok else 'FAIL'}] {symbol} {sig_type}")
-
-            except Exception as e:
-                tg_logs.append(f"  [SKIP] {symbol}: {type(e).__name__}")
-                continue
-
-        # 换行，扫描结束
         sys.stdout.write("\n")
-        print(f"[{timeframe}] 巡逻完毕 | 新增信号 {alert_count} 个")
-        for line in tg_logs[-20:]:   # 只打印最近 20 条，避免刷屏
+        elapsed = time.time() - t0
+        print(f"[{timeframe}] 巡逻完毕 | 耗时 {elapsed:.1f}s | 新增信号 {alert_count} 个")
+        for line in tg_logs[-30:]:
             print(line)
 
-        # 每个周期扫完持久化一次去重缓存，防止异常中断丢记录
         _save_sent_signals()
 
     except Exception as e:
@@ -495,7 +600,7 @@ def scan_markets(exchange, timeframe):
 
 
 # ==============================================================================
-# 7. 【主循环】
+# 8. 【主循环】
 # ==============================================================================
 
 def main():
@@ -510,18 +615,20 @@ def main():
 
     print("[INIT] 发送启动宣告至 Telegram...")
     send_tg(
-        f"<b>Quantum Flow 背离侦察系统启动</b>\n"
+        f"<b>Quantum Flow 背离侦察系统 v2 启动</b>\n"
         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"监控周期: 15m / 1h / 4h\n"
         f"合约池: Binance USDT 永续 Top {TOP_N} (按 24h 成交额)\n"
-        f"信号: Quantum/Flow/双背离共振\n"
+        f"并发扫描: {SCAN_WORKERS} 线程\n"
+        f"新鲜度: {FRESH_BARS} 根 K 内\n"
+        f"信号: Quantum/Flow/双背离共振 (带强度星级)\n"
         f"状态: 全市场扫描中..."
     )
 
     last_run_times = {task['timeframe']: 0 for task in SCAN_TASKS}
 
     print("\n" + "=" * 60)
-    print("  Quantum Flow 背离侦察系统部署成功")
+    print("  Quantum Flow 背离侦察系统 v2 部署成功")
     print("=" * 60 + "\n")
 
     while True:
@@ -545,7 +652,7 @@ def main():
             break
         except Exception as e:
             print(f"\n[ERROR] 主循环异常: {type(e).__name__}: {e}")
-            time.sleep(60)   # 等一分钟重试
+            time.sleep(60)
 
 
 if __name__ == "__main__":
