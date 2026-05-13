@@ -36,8 +36,8 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "aErEwJ3gOvBr6mS92zOaJ9mhbB
 
 # --- 扫描任务表 ---
 SCAN_TASKS = [
-    {"timeframe": "15m", "interval_minutes": 5},
-    {"timeframe": "1h",  "interval_minutes": 15},
+    {"timeframe": "15m", "interval_minutes": 3},
+    {"timeframe": "1h",  "interval_minutes": 8},
     {"timeframe": "4h",  "interval_minutes": 60},
 ]
 
