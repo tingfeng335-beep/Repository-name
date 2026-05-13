@@ -31,7 +31,11 @@ from datetime import datetime, timezone
 # ==============================================================================
 
 TG_TOKEN           = os.getenv("TG_TOKEN",           "8597069493:AAEmXzUJ3Yv42NGd2EsP3M93aatLjqzPWFI")
-TG_CHAT_ID         = os.getenv("TG_CHAT_ID",         "7470996017")
+# 多用户推送：把需要接收的 chat_id 写进列表里即可；脚本会逐个推送
+TG_CHAT_IDS        = [
+    "7470996017",    # 你自己
+    "6587035253",    # 癫皇比特币 @Nick_Tuz
+]
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY",    "LmoOgqAkSmcpilfJcdEW4genLy76swigcTnIMPVR7gvqwR55aY4lxjdJbigzeKY8")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "aErEwJ3gOvBr6mS92zOaJ9mhbBqeors2WXp7nFESyZaJQ2e38giKwWr0NMAXofJI")
 
@@ -43,7 +47,7 @@ SCAN_TASKS = [
 ]
 
 # --- 合约池设置：按 24h 成交额降序取前 TOP_N 个 ---
-TOP_N               = 200
+TOP_N               = 230
 MARKETS_CACHE_TTL   = 3600      # 合约列表缓存 1 小时
 
 # --- 并发设置 ---
@@ -62,6 +66,15 @@ FRESH_BARS_MAP = {
     "4h":  2,
 }
 FRESH_BARS_DEFAULT = 3
+
+# --- 分周期消息样式：用 emoji + 标签区分不同周期 ---
+# 一眼能分辨是短线（15m）/ 中线（1h）/ 主力（4h）信号
+TF_STYLE_MAP = {
+    "15m": {"emoji": "⚡",  "tag": "短线"},
+    "1h":  {"emoji": "🎯",  "tag": "中线"},
+    "4h":  {"emoji": "💎",  "tag": "主力"},
+}
+TF_STYLE_DEFAULT = {"emoji": "📊", "tag": ""}
 
 # --- 信号推送分级：>= MSG_TIER_STARS 的单独推；< 的合并成摘要 ---
 # 建议：4 = 只有 4~5 星单独推，1~3 星合并；5 = 只有 5 星单独推；0 = 所有单独推（旧行为）
@@ -89,40 +102,47 @@ _tg_lock = threading.Lock()   # 并发环境下串行化 TG 发送，避免触�
 
 
 def send_tg(message, retries=3):
-    """发送战报至 Telegram，失败指数退避重试（线程安全）"""
+    """发送战报至 Telegram，失败指数退避重试（线程安全）
+    对 TG_CHAT_IDS 里的每个用户逐一推送，任一用户发送成功即视为 True
+    """
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": message, "parse_mode": "HTML"}
 
     with _tg_lock:
-        for attempt in range(retries):
-            try:
-                resp = requests.post(
-                    url, json=payload,
-                    timeout=(3, 5),
-                    proxies=_NO_PROXY
-                )
-                result = resp.json()
-                if result.get("ok"):
-                    return True
-                desc = result.get("description", "")
-                if "Too Many Requests" in desc and attempt < retries - 1:
-                    retry_after = result.get("parameters", {}).get("retry_after", 2 ** attempt)
-                    time.sleep(retry_after)
-                    continue
-                print(f"  [WARN] TG 返回错误: {desc}")
-                return False
-            except (requests.exceptions.ConnectTimeout,
-                    requests.exceptions.ReadTimeout,
-                    requests.exceptions.ConnectionError) as e:
-                if attempt < retries - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                print(f"  [WARN] TG 最终失败: {type(e).__name__}: {e}")
-                return False
-            except Exception as e:
-                print(f"  [WARN] TG 发送异常: {type(e).__name__}: {e}")
-                return False
-        return False
+        any_ok = False
+        for chat_id in TG_CHAT_IDS:
+            payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+            sent = False
+            for attempt in range(retries):
+                try:
+                    resp = requests.post(
+                        url, json=payload,
+                        timeout=(3, 5),
+                        proxies=_NO_PROXY
+                    )
+                    result = resp.json()
+                    if result.get("ok"):
+                        sent = True
+                        break
+                    desc = result.get("description", "")
+                    if "Too Many Requests" in desc and attempt < retries - 1:
+                        retry_after = result.get("parameters", {}).get("retry_after", 2 ** attempt)
+                        time.sleep(retry_after)
+                        continue
+                    print(f"  [WARN] TG({chat_id}) 返回错误: {desc}")
+                    break
+                except (requests.exceptions.ConnectTimeout,
+                        requests.exceptions.ReadTimeout,
+                        requests.exceptions.ConnectionError) as e:
+                    if attempt < retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    print(f"  [WARN] TG({chat_id}) 最终失败: {type(e).__name__}: {e}")
+                    break
+                except Exception as e:
+                    print(f"  [WARN] TG({chat_id}) 发送异常: {type(e).__name__}: {e}")
+                    break
+            any_ok = any_ok or sent
+        return any_ok
 
 
 # ==============================================================================
@@ -483,6 +503,9 @@ def detect_divergence_signals(df, symbol, timeframe):
         stars = _strength_stars(ratio)
         age   = _age(idx)
         bar_t = _bar_str(idx)
+        tf_style = TF_STYLE_MAP.get(timeframe, TF_STYLE_DEFAULT)
+        tf_emoji = tf_style["emoji"]
+        tf_tag   = tf_style["tag"]
         detail_line = {
             "DBL_BULL": f"Quantum + Flow 同时底背离",
             "DBL_BEAR": f"Quantum + Flow 同时顶背离",
@@ -492,8 +515,10 @@ def detect_divergence_signals(df, symbol, timeframe):
             "M_BEAR":   f"Flow: {curr_mf:.2f} | 价格新高，Flow 未新高",
         }[sig_type]
 
+        tf_label = f"{tf_emoji} {tf_tag}·{timeframe}" if tf_tag else f"{tf_emoji} {timeframe}"
+
         msg = (
-            f"{title_prefix} <b>{symbol} [{timeframe}] {title_cn}</b>\n"
+            f"{title_prefix} <b>[{tf_label}] {symbol} {title_cn}</b>\n"
             f"强度: {_stars_str(stars)}  ({ratio:.1f}x 阈值)\n"
             f"{detail_line}\n"
             f"新鲜度: {age} 根前 | 价: {curr_p:.6f}\n"
@@ -597,7 +622,12 @@ def _build_summary(timeframe, low_tier_rows):
     bulls = [r for r in low_tier_rows if r['sig_type'].endswith('BULL')]
     bears = [r for r in low_tier_rows if r['sig_type'].endswith('BEAR')]
 
-    lines = [f"<b>📊 {timeframe} 摘要 | 本轮新增 {len(low_tier_rows)} 个低星级信号</b>"]
+    tf_style = TF_STYLE_MAP.get(timeframe, TF_STYLE_DEFAULT)
+    tf_emoji = tf_style["emoji"]
+    tf_tag   = tf_style["tag"]
+    tf_label = f"{tf_emoji} {tf_tag}·{timeframe}" if tf_tag else f"{tf_emoji} {timeframe}"
+
+    lines = [f"<b>📊 [{tf_label}] 摘要 | 本轮新增 {len(low_tier_rows)} 个低星级信号</b>"]
 
     def _fmt_group(title, rows):
         if not rows:
