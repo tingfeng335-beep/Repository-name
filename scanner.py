@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quantum Flow 背离侦察系统 v3
+Quantum Flow 背离侦察系统 v3.2
 - 按 Binance USDT 永续合约 24h 成交额降序取前 TOP_N 个扫描
 - 严格排除交割合约、USDC 计价合约
 - 并发扫描（线程池），单周期扫描提速 3~5 倍
@@ -8,8 +8,9 @@ Quantum Flow 背离侦察系统 v3
 - 信号带强度分 (★ 1~5) + 结构化日志 signals.log
 - 丢弃未收盘 K 线，防止信号闪烁
 - 主循环顶层异常保护，7x24 不挂
-- v3 新增: 失败合约自动退避（三振出局，冷藏 1 小时）
-- v3 新增: 分周期独立 FRESH_BARS 配置
+- 失败合约自动退避（三振出局，冷藏 1 小时）
+- 分周期独立 FRESH_BARS 配置
+- v3.2 新增: 信号按强度分级推送（高星级单独推 + 低星级合并摘要）
 """
 
 import ccxt
@@ -61,6 +62,10 @@ FRESH_BARS_MAP = {
     "4h":  2,
 }
 FRESH_BARS_DEFAULT = 3
+
+# --- 信号推送分级：>= MSG_TIER_STARS 的单独推；< 的合并成摘要 ---
+# 建议：4 = 只有 4~5 星单独推，1~3 星合并；5 = 只有 5 星单独推；0 = 所有单独推（旧行为）
+MSG_TIER_STARS      = 4
 
 # --- 失败合约退避 ---
 FAIL_STRIKE_LIMIT = 3             # 连续失败多少次进入冷藏
@@ -456,8 +461,9 @@ def detect_divergence_signals(df, symbol, timeframe):
     m_bull_sig = fresh("M_BULL")
     m_bear_sig = fresh("M_BEAR")
 
-    dbl_bull = co_fresh("F_BULL", "M_BULL")
-    dbl_bear = co_fresh("F_BEAR", "M_BEAR")
+    # 双背离共振已禁用（用户要求）
+    dbl_bull = False
+    dbl_bear = False
 
     curr_f   = float(df['fusion_d'].iloc[-1])
     curr_mf  = float(df['mf'].iloc[-1])
@@ -500,21 +506,6 @@ def detect_divergence_signals(df, symbol, timeframe):
         }
         return (sig_type, msg, _pivot_time_ms(idx), log_row)
 
-    if dbl_bull:
-        fi = last["F_BULL"]["idx"]; mi = last["M_BULL"]["idx"]
-        idx = max(fi, mi)
-        # 共振强度：取两侧比率的几何均值
-        r_f = last["F_BULL"]["amp"] / F_MD
-        r_m = last["M_BULL"]["amp"] / M_MD
-        ratio = (r_f * r_m) ** 0.5
-        out.append(_build("DBL_BULL", "[UP x2]", "双底背离共振", idx, ratio))
-    if dbl_bear:
-        fi = last["F_BEAR"]["idx"]; mi = last["M_BEAR"]["idx"]
-        idx = max(fi, mi)
-        r_f = last["F_BEAR"]["amp"] / F_MD
-        r_m = last["M_BEAR"]["amp"] / M_MD
-        ratio = (r_f * r_m) ** 0.5
-        out.append(_build("DBL_BEAR", "[DN x2]", "双顶背离共振", idx, ratio))
     if f_bull_sig and not dbl_bull:
         idx = last["F_BULL"]["idx"]
         ratio = last["F_BULL"]["amp"] / F_MD
@@ -581,7 +572,54 @@ def get_top_symbols(exchange, top_n=TOP_N, ttl=MARKETS_CACHE_TTL):
 
 
 # ==============================================================================
-# 8. 【侦察引擎：并发 + 失败退避】
+# 8. 【信号分级推送】
+# ==============================================================================
+
+_SIG_LABEL = {
+    "F_BULL":   "Quantum底",
+    "F_BEAR":   "Quantum顶",
+    "M_BULL":   "Flow底",
+    "M_BEAR":   "Flow顶",
+}
+
+
+def _is_high_tier(sig_type, stars):
+    """判断是否走单独推送通道（星级 >= MSG_TIER_STARS）"""
+    return stars >= MSG_TIER_STARS
+
+
+def _build_summary(timeframe, low_tier_rows):
+    """把一批低星级信号合并成一条摘要消息"""
+    if not low_tier_rows:
+        return None
+    # 按星级降序、方向分组
+    low_tier_rows = sorted(low_tier_rows, key=lambda r: (-r['stars'], r['sig_type']))
+    bulls = [r for r in low_tier_rows if r['sig_type'].endswith('BULL')]
+    bears = [r for r in low_tier_rows if r['sig_type'].endswith('BEAR')]
+
+    lines = [f"<b>📊 {timeframe} 摘要 | 本轮新增 {len(low_tier_rows)} 个低星级信号</b>"]
+
+    def _fmt_group(title, rows):
+        if not rows:
+            return []
+        out = [f"\n<b>{title}</b> ({len(rows)})"]
+        for r in rows[:15]:   # 每方向最多 15 条
+            label = _SIG_LABEL.get(r['sig_type'], r['sig_type'])
+            out.append(
+                f"  {_stars_str(r['stars'])} {r['symbol']} "
+                f"[{label}] {r['ratio']:.1f}x | 价 {r['price']:.4f} | {r['age']}根前"
+            )
+        if len(rows) > 15:
+            out.append(f"  ... 还有 {len(rows) - 15} 条（查看 signals.log）")
+        return out
+
+    lines += _fmt_group("🔺 看涨", bulls)
+    lines += _fmt_group("🔻 看跌", bears)
+    return "\n".join(lines)
+
+
+# ==============================================================================
+# 9. 【侦察引擎：并发 + 失败退避 + 分级推送】
 # ==============================================================================
 
 def _scan_one(exchange, symbol, timeframe):
@@ -608,7 +646,7 @@ def _scan_one(exchange, symbol, timeframe):
 
 
 def scan_markets(exchange, timeframe):
-    """并发扫描 Top N 合约（带失败退避）"""
+    """并发扫描 Top N 合约（带失败退避 + 分级推送）"""
     t0 = time.time()
     try:
         all_symbols = get_top_symbols(exchange)
@@ -623,9 +661,10 @@ def scan_markets(exchange, timeframe):
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [SCAN] 周期:{timeframe} | "
               f"合约:{total} | 并发:{SCAN_WORKERS} | 新鲜度≤{fresh_bars}{extra}")
 
-        alert_count  = 0
+        high_tier_queue = []    # [(msg, log_row), ...] 单独推送
+        low_tier_queue  = []    # [log_row, ...] 合并摘要
         done_count   = 0
-        cold_count   = 0    # 本轮新增冷藏的合约数
+        cold_count   = 0
         tg_logs      = []
 
         with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
@@ -638,11 +677,12 @@ def scan_markets(exchange, timeframe):
                     _, signals = fut.result()
                     record_success(sym, timeframe)
                     for sig_type, msg, _bt, log_row in signals:
-                        ok = send_tg(msg)
+                        # 无论分级如何，都写入日志
                         log_signal(log_row)
-                        alert_count += 1
-                        tag = 'OK' if ok else 'FAIL'
-                        tg_logs.append(f"  [{tag}] {sym} {sig_type} {_stars_str(log_row['stars'])}")
+                        if _is_high_tier(sig_type, log_row['stars']):
+                            high_tier_queue.append((msg, log_row))
+                        else:
+                            low_tier_queue.append(log_row)
                 except Exception as e:
                     triggered = record_failure(sym, timeframe)
                     if triggered:
@@ -652,18 +692,43 @@ def scan_markets(exchange, timeframe):
                         tg_logs.append(f"  [SKIP] {sym}: {type(e).__name__}")
 
                 # 进度条
+                alert_preview = len(high_tier_queue) + len(low_tier_queue)
                 pct = done_count / total * 100 if total > 0 else 100
                 sys.stdout.write(
-                    f"\r[{timeframe}] {pct:5.1f}% | {done_count:>3}/{total} | 警报:{alert_count}   "
+                    f"\r[{timeframe}] {pct:5.1f}% | {done_count:>3}/{total} | 警报:{alert_preview}   "
                 )
                 sys.stdout.flush()
 
         sys.stdout.write("\n")
+
+        # --- 推送阶段 ---
+        # 1. 高星级 / 双背离：单独推
+        sent_high = 0
+        for msg, log_row in high_tier_queue:
+            ok = send_tg(msg)
+            sent_high += 1 if ok else 0
+            tag = 'OK' if ok else 'FAIL'
+            tg_logs.append(
+                f"  [{tag}] {log_row['symbol']} {log_row['sig_type']} {_stars_str(log_row['stars'])}"
+            )
+
+        # 2. 低星级：合并摘要推
+        summary = _build_summary(timeframe, low_tier_queue)
+        sent_summary = False
+        if summary:
+            sent_summary = send_tg(summary)
+            tag = 'OK' if sent_summary else 'FAIL'
+            tg_logs.append(f"  [{tag}] [摘要] {timeframe} 合并 {len(low_tier_queue)} 条低星级")
+
         elapsed = time.time() - t0
-        summary = f"耗时 {elapsed:.1f}s | 新增信号 {alert_count} 个"
+        total_alerts = len(high_tier_queue) + len(low_tier_queue)
+        summary_line = (
+            f"耗时 {elapsed:.1f}s | 新增信号 {total_alerts} 个 "
+            f"(单推 {len(high_tier_queue)} / 摘要 {len(low_tier_queue)})"
+        )
         if cold_count:
-            summary += f" | 新冷藏 {cold_count} 个"
-        print(f"[{timeframe}] 巡逻完毕 | {summary}")
+            summary_line += f" | 新冷藏 {cold_count} 个"
+        print(f"[{timeframe}] 巡逻完毕 | {summary_line}")
         for line in tg_logs[-30:]:
             print(line)
 
@@ -674,7 +739,7 @@ def scan_markets(exchange, timeframe):
 
 
 # ==============================================================================
-# 9. 【主循环】
+# 10. 【主循环】
 # ==============================================================================
 
 def main():
@@ -690,22 +755,26 @@ def main():
     print("[INIT] 发送启动宣告至 Telegram...")
     fresh_desc = " / ".join(f"{tf}:{FRESH_BARS_MAP.get(tf, FRESH_BARS_DEFAULT)}根"
                             for tf in (t["timeframe"] for t in SCAN_TASKS))
+    interval_desc = " / ".join(f"{t['timeframe']}:{t['interval_minutes']}分"
+                               for t in SCAN_TASKS)
     send_tg(
-        f"<b>Quantum Flow 背离侦察系统 v3 启动</b>\n"
+        f"<b>Quantum Flow 背离侦察系统 v3.2 启动</b>\n"
         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"监控周期: 15m / 1h / 4h\n"
+        f"扫描频率: {interval_desc}\n"
         f"合约池: Binance USDT 永续 Top {TOP_N} (按 24h 成交额)\n"
         f"并发扫描: {SCAN_WORKERS} 线程\n"
         f"新鲜度: {fresh_desc}\n"
         f"失败退避: 连续 {FAIL_STRIKE_LIMIT} 次 → 冷藏 {COOLDOWN_SECONDS // 60} 分钟\n"
-        f"信号: Quantum/Flow/双背离共振 (带强度星级)\n"
+        f"推送分级: ≥ {MSG_TIER_STARS}★ 单独推 / &lt; {MSG_TIER_STARS}★ 合并摘要\n"
+        f"信号: Quantum/Flow 背离 (带强度星级)\n"
         f"状态: 全市场扫描中..."
     )
 
     last_run_times = {task['timeframe']: 0 for task in SCAN_TASKS}
 
     print("\n" + "=" * 60)
-    print("  Quantum Flow 背离侦察系统 v3 部署成功")
+    print("  Quantum Flow 背离侦察系统 v3.2 部署成功")
     print("=" * 60 + "\n")
 
     while True:
