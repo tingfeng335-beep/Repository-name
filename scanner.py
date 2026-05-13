@@ -328,8 +328,8 @@ def calculate_quantum_flow(df):
 
 def detect_pivots(series_values, left, right):
     """
-    检测枢轴高低点（左严格 > / 右 >=；左严格 < / 右 <=），
-    贴近 TradingView ta.pivothigh/pivotlow 的常见实现。
+    检测枢轴高低点 —— 严格对齐 TradingView 的 ta.pivothigh/pivotlow。
+    Pine 官方实现：两侧都用严格 > / 严格 <（中心点必须严格大于/小于所有邻居）。
     """
     n = len(series_values)
     ph_vals = [np.nan] * n
@@ -337,13 +337,13 @@ def detect_pivots(series_values, left, right):
 
     for i in range(left, n - right):
         v = series_values[i]
-        is_high = (all(v >  series_values[i - j] for j in range(1, left + 1)) and
-                   all(v >= series_values[i + j] for j in range(1, right + 1)))
+        is_high = (all(v > series_values[i - j] for j in range(1, left + 1)) and
+                   all(v > series_values[i + j] for j in range(1, right + 1)))
         if is_high:
             ph_vals[i] = v
 
-        is_low = (all(v <  series_values[i - j] for j in range(1, left + 1)) and
-                  all(v <= series_values[i + j] for j in range(1, right + 1)))
+        is_low = (all(v < series_values[i - j] for j in range(1, left + 1)) and
+                  all(v < series_values[i + j] for j in range(1, right + 1)))
         if is_low:
             pl_vals[i] = v
 
@@ -440,9 +440,11 @@ def detect_divergence_signals(df, symbol, timeframe):
             pb = i - M_PR
             pv = m_ph_vals[i]
             pp = high_arr[pb] if pb >= 0 else high_arr[i]
+            # 对齐 Pine ta.highest/ta.lowest(high, m_pl*3)：取最近 M_PL*3 根 K（含当前）
             lookback = M_PL * 3
-            hh = high_arr[max(0, i - lookback):i + 1].max()
-            ll = low_arr[max(0, i - lookback):i + 1].min()
+            start_k  = max(0, i - lookback + 1)
+            hh = high_arr[start_k:i + 1].max()
+            ll = low_arr[start_k:i + 1].min()
             if pp >= ll + (hh - ll) * 0.5:
                 if not np.isnan(mh_v) and not np.isnan(mh_b):
                     amp = mh_v - pv
@@ -455,9 +457,11 @@ def detect_divergence_signals(df, symbol, timeframe):
             pb = i - M_PR
             pv = m_pl_vals[i]
             pp = low_arr[pb] if pb >= 0 else low_arr[i]
+            # 对齐 Pine ta.highest/ta.lowest(high, m_pl*3)：取最近 M_PL*3 根 K（含当前）
             lookback = M_PL * 3
-            hh = high_arr[max(0, i - lookback):i + 1].max()
-            ll = low_arr[max(0, i - lookback):i + 1].min()
+            start_k  = max(0, i - lookback + 1)
+            hh = high_arr[start_k:i + 1].max()
+            ll = low_arr[start_k:i + 1].min()
             if pp <= ll + (hh - ll) * 0.5:
                 if not np.isnan(ml_v) and not np.isnan(ml_b):
                     amp = pv - ml_v
