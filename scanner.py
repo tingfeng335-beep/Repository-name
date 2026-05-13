@@ -13,6 +13,7 @@ Quantum Flow 背离侦察系统 v3.2
 - v3.2 新增: 信号按强度分级推送（高星级单独推 + 低星级合并摘要）
 - v3.4 修复: (1) sent_signals.json 原子写入，防损坏 (2) 启动首轮静默，避免爆推
 - v3.5 新增: (1) 4h 扫描提速 60→20 分钟 (2) 分周期色带 4h红/1h蓝/15m绿，醒目区分
+- v3.6 新增: (1) TOP_N 230→190 (2) 心跳消息(每6h) (3) 崩溃通知 (4) 每日日报(UTC 0点)
 """
 
 import ccxt
@@ -49,7 +50,7 @@ SCAN_TASKS = [
 ]
 
 # --- 合约池设置：按 24h 成交额降序取前 TOP_N 个 ---
-TOP_N               = 230
+TOP_N               = 190
 MARKETS_CACHE_TTL   = 3600      # 合约列表缓存 1 小时
 
 # --- 并发设置 ---
@@ -95,6 +96,10 @@ SIGNALS_LOG_FILE   = "signals.log"
 
 # --- 去重记录保留时长（毫秒） ---
 SIGNAL_RETENTION_MS = 3 * 24 * 3600 * 1000    # 3 天
+
+# --- v3.6 监控：心跳 / 日报 ---
+HEARTBEAT_INTERVAL_HOURS = 6     # 心跳间隔：每 6 小时发一条"还活着"
+DAILY_REPORT_HOUR_UTC    = 0     # 日报推送时刻（UTC 0 点）
 
 # ==============================================================================
 # 2. 【通讯模块】
@@ -248,6 +253,31 @@ def record_failure(symbol, tf):
 # ==============================================================================
 
 _log_lock = threading.Lock()
+
+
+# v3.6 监控统计：进程内累计计数（用于心跳消息、崩溃通知）
+_stats_lock = threading.Lock()
+_run_stats = {
+    "start_time": time.time(),
+    "scan_count": 0,          # 累计扫描轮数（所有周期加起来）
+    "signal_count": 0,        # 累计新增信号数（单推 + 摘要里的）
+    "last_scan_time": 0,      # 最近一次扫描完成时间
+}
+
+
+def _bump_stats(scans=0, signals=0):
+    """扫描完后更新统计"""
+    with _stats_lock:
+        _run_stats["scan_count"] += scans
+        _run_stats["signal_count"] += signals
+        if scans:
+            _run_stats["last_scan_time"] = time.time()
+
+
+def _snapshot_stats():
+    """拍快照，避免持锁读"""
+    with _stats_lock:
+        return dict(_run_stats)
 
 
 def log_signal(row):
@@ -790,12 +820,155 @@ def scan_markets(exchange, timeframe):
 
         _save_sent_signals()
 
+        # v3.6 更新累计统计（供心跳/日报使用）
+        _bump_stats(scans=1, signals=total_alerts)
+
     except Exception as e:
         print(f"\n[ERROR] 扫描引擎异常: {type(e).__name__}: {e}")
 
 
 # ==============================================================================
-# 10. 【主循环】
+# 10. 【监控：心跳 / 崩溃通知 / 每日日报】(v3.6 新增)
+# ==============================================================================
+
+def _parse_log_row_from_line(line):
+    """解析 signals.log 的一行 CSV，返回 dict 或 None"""
+    parts = line.rstrip("\n").split(",")
+    if len(parts) < 11:
+        return None
+    try:
+        return {
+            "time_utc":  parts[0],
+            "symbol":    parts[1],
+            "tf":        parts[2],
+            "sig_type":  parts[3],
+            "stars":     int(parts[4]),
+            "ratio":     float(parts[5]),
+            "price":     float(parts[6]),
+        }
+    except (ValueError, IndexError):
+        return None
+
+
+def _read_signals_last_hours(hours):
+    """读取 signals.log 最近 N 小时的信号记录"""
+    if not os.path.exists(SIGNALS_LOG_FILE):
+        return []
+
+    cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
+    rows = []
+    try:
+        with open(SIGNALS_LOG_FILE, "r", encoding="utf-8") as f:
+            next(f, None)    # 跳过 header
+            for line in f:
+                row = _parse_log_row_from_line(line)
+                if not row:
+                    continue
+                try:
+                    t = datetime.strptime(row["time_utc"], "%Y-%m-%d %H:%M:%S") \
+                        .replace(tzinfo=timezone.utc).timestamp()
+                    if t >= cutoff:
+                        rows.append(row)
+                except ValueError:
+                    continue
+    except Exception as e:
+        print(f"  [WARN] 读取 signals.log 失败: {e}")
+    return rows
+
+
+def send_heartbeat():
+    """心跳消息：汇报脚本还活着 + 最近统计"""
+    stats = _snapshot_stats()
+    uptime_hours = (time.time() - stats["start_time"]) / 3600
+    last_scan_ago = (time.time() - stats["last_scan_time"]) / 60 if stats["last_scan_time"] else -1
+
+    msg = (
+        f"💓 <b>心跳</b> | 脚本运行中\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ 运行时长: {uptime_hours:.1f} 小时\n"
+        f"🔍 累计扫描: {stats['scan_count']} 轮\n"
+        f"📊 累计信号: {stats['signal_count']} 条\n"
+        f"🕐 上次扫描: {last_scan_ago:.1f} 分钟前\n"
+        f"🕐 当前时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    )
+    ok = send_tg(msg)
+    print(f"[HEARTBEAT] {'OK' if ok else 'FAIL'} | 运行 {uptime_hours:.1f}h / 扫描 {stats['scan_count']} / 信号 {stats['signal_count']}")
+
+
+def send_daily_report():
+    """每日日报：汇总过去 24 小时信号统计"""
+    rows = _read_signals_last_hours(24)
+
+    if not rows:
+        msg = (
+            f"📅 <b>每日日报</b> (过去 24 小时)\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"暂无信号记录"
+        )
+        ok = send_tg(msg)
+        print(f"[DAILY] {'OK' if ok else 'FAIL'} | 0 条信号")
+        return
+
+    # 按周期统计
+    tf_count = {"15m": 0, "1h": 0, "4h": 0}
+    type_count = {"F_BULL": 0, "F_BEAR": 0, "M_BULL": 0, "M_BEAR": 0}
+    for r in rows:
+        if r["tf"] in tf_count:
+            tf_count[r["tf"]] += 1
+        if r["sig_type"] in type_count:
+            type_count[r["sig_type"]] += 1
+
+    # 最强 5 个信号（按 ratio 降序）
+    top5 = sorted(rows, key=lambda r: -r["ratio"])[:5]
+
+    lines = [
+        f"📅 <b>每日日报</b> (过去 24 小时)",
+        f"━━━━━━━━━━━━━━━━━━━━",
+        f"📊 <b>总信号数</b>: {len(rows)} 条",
+        f"",
+        f"<b>按周期</b>:",
+        f"  🟢 15m: {tf_count['15m']} 条",
+        f"  🔵  1h: {tf_count['1h']} 条",
+        f"  🔴  4h: {tf_count['4h']} 条",
+        f"",
+        f"<b>按类型</b>:",
+        f"  🔺 Quantum底: {type_count['F_BULL']}  |  🔻 Quantum顶: {type_count['F_BEAR']}",
+        f"  🔺    Flow底: {type_count['M_BULL']}  |  🔻    Flow顶: {type_count['M_BEAR']}",
+        f"",
+        f"<b>🔥 最强 5 个信号</b>:",
+    ]
+    for r in top5:
+        stars_str = "★" * r["stars"] + "☆" * (5 - r["stars"])
+        lines.append(
+            f"  {stars_str} {r['symbol']} [{r['tf']} {r['sig_type']}] "
+            f"{r['ratio']:.1f}x @ {r['price']:.4f}"
+        )
+    lines.append(f"━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+
+    msg = "\n".join(lines)
+    ok = send_tg(msg)
+    print(f"[DAILY] {'OK' if ok else 'FAIL'} | {len(rows)} 条信号")
+
+
+def send_crash_notice(exc_type, exc_value):
+    """程序崩溃时发通知（简短，避免发不出去）"""
+    try:
+        msg = (
+            f"🚨 <b>脚本崩溃</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+            f"异常类型: <code>{exc_type}</code>\n"
+            f"错误信息: <code>{str(exc_value)[:300]}</code>\n"
+            f"请尽快检查服务器！"
+        )
+        send_tg(msg)
+    except Exception as e:
+        print(f"  [WARN] 崩溃通知发送失败: {e}")
+
+
+# ==============================================================================
+# 11. 【主循环】
 # ==============================================================================
 
 def main():
@@ -823,6 +996,7 @@ def main():
         f"新鲜度: {fresh_desc}\n"
         f"失败退避: 连续 {FAIL_STRIKE_LIMIT} 次 → 冷藏 {COOLDOWN_SECONDS // 60} 分钟\n"
         f"推送分级: ≥ {MSG_TIER_STARS}★ 单独推 / &lt; {MSG_TIER_STARS}★ 合并摘要\n"
+        f"监控: 💓 心跳每{HEARTBEAT_INTERVAL_HOURS}h / 📅 日报UTC 0点 / 🚨 崩溃自动通知\n"
         f"信号: Quantum/Flow 背离 (带强度星级)\n"
         f"状态: 全市场扫描中..."
     )
@@ -831,6 +1005,12 @@ def main():
     # 避免启动瞬间 3 个周期同时扫描、爆推一堆旧信号
     _now_init = time.time()
     last_run_times = {task['timeframe']: _now_init for task in SCAN_TASKS}
+
+    # v3.6 监控调度：
+    # - 心跳：每 HEARTBEAT_INTERVAL_HOURS 小时一次，从启动时间开始算
+    # - 日报：每天 UTC DAILY_REPORT_HOUR_UTC 点（0 点）一次
+    last_heartbeat_time = _now_init                    # 启动后 HEARTBEAT_INTERVAL_HOURS 小时才发第一条
+    last_daily_date     = datetime.now(timezone.utc).date()   # 启动当天不发日报，避免重启刷屏
 
     print("\n" + "=" * 60)
     print("  Quantum Flow 背离侦察系统 v3.2 部署成功")
@@ -847,6 +1027,17 @@ def main():
                     last_run_times[tf] = time.time()
                     time.sleep(2)
 
+            # v3.6 心跳消息（每 6 小时）
+            if now - last_heartbeat_time >= HEARTBEAT_INTERVAL_HOURS * 3600:
+                send_heartbeat()
+                last_heartbeat_time = now
+
+            # v3.6 每日日报（UTC 0 点第一次进入循环时发）
+            now_utc = datetime.now(timezone.utc)
+            if now_utc.hour == DAILY_REPORT_HOUR_UTC and now_utc.date() != last_daily_date:
+                send_daily_report()
+                last_daily_date = now_utc.date()
+
             sys.stdout.write(f"\r[{datetime.now().strftime('%H:%M:%S')}] 待机监视中...   ")
             sys.stdout.flush()
             time.sleep(10)
@@ -861,4 +1052,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # v3.6 顶层崩溃捕获：main() 里的异常已经会被内部 try 吃掉
+    # 这里捕获的是初始化阶段的致命错误（如 ccxt 初始化失败、import 失败等）
+    try:
+        main()
+    except Exception as _e:
+        print(f"\n[FATAL] 顶层崩溃: {type(_e).__name__}: {_e}")
+        send_crash_notice(type(_e).__name__, _e)
+        raise
