@@ -14,7 +14,6 @@ Quantum Flow 背离侦察系统 v3.2
 - v3.4 修复: (1) sent_signals.json 原子写入，防损坏 (2) 启动首轮静默，避免爆推
 - v3.5 新增: (1) 4h 扫描提速 60→20 分钟 (2) 分周期色带 4h红/1h蓝/15m绿，醒目区分
 - v3.6 新增: (1) TOP_N 230→190 (2) 心跳消息(每6h) (3) 崩溃通知 (4) 每日日报(UTC 0点)
-- v3.7 修复: 幽灵背离 — 拉 K 线数 200→500 + 枢轴扫描起点 +20→+50，避免在指标未预热区间找假枢轴
 """
 
 import ccxt
@@ -424,7 +423,7 @@ def detect_divergence_signals(df, symbol, timeframe):
 
     out = []
     n = len(df)
-    if n < 200:   # v3.7 样本数检查 100→200：保证指标已充分预热
+    if n < 100:
         return out
 
     fusion_arr = df['fusion_d'].values
@@ -449,10 +448,7 @@ def detect_divergence_signals(df, symbol, timeframe):
         "M_BEAR": {"idx": -1, "amp": 0.0},
     }
 
-    # v3.7 枢轴扫描起点 +20→+50：跳过 fusion_d/mf 指标不稳定区间
-    # rolling(50).std 需要 50 根才出值，rolling(60).mean 需要 60 根
-    # 从第 60 根开始扫才能保证枢轴基于稳定的指标数值
-    start = max(F_PL, F_PR, M_PL, M_PR) + 50
+    start = max(F_PL, F_PR, M_PL, M_PR) + 20
 
     for i in range(start, n):
         # ── Quantum 顶背离 ──
@@ -718,10 +714,8 @@ def _scan_one(exchange, symbol, timeframe):
     signals_to_send: [(sig_type, msg, bar_time, log_row), ...]
     已做 should_send 过滤
     """
-    # v3.7 拉 500 根 K（原 200）：让 rolling(50).std / rolling(60).mean / ewm 充分预热
-    # 修幽灵背离：避免在 fusion_d/mf 还不稳定的前 60 根里找到"假枢轴"
-    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=500)
-    if len(bars) < 200:
+    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=200)
+    if len(bars) < 101:
         return symbol, []
 
     df = pd.DataFrame(bars, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
