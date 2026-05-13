@@ -12,6 +12,7 @@ Quantum Flow 背离侦察系统 v3.2
 - 分周期独立 FRESH_BARS 配置
 - v3.2 新增: 信号按强度分级推送（高星级单独推 + 低星级合并摘要）
 - v3.4 修复: (1) sent_signals.json 原子写入，防损坏 (2) 启动首轮静默，避免爆推
+- v3.5 新增: (1) 4h 扫描提速 60→20 分钟 (2) 分周期色带 4h红/1h蓝/15m绿，醒目区分
 """
 
 import ccxt
@@ -44,7 +45,7 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "aErEwJ3gOvBr6mS92zOaJ9mhbB
 SCAN_TASKS = [
     {"timeframe": "15m", "interval_minutes": 3},
     {"timeframe": "1h",  "interval_minutes": 8},
-    {"timeframe": "4h",  "interval_minutes": 60},
+    {"timeframe": "4h",  "interval_minutes": 20},
 ]
 
 # --- 合约池设置：按 24h 成交额降序取前 TOP_N 个 ---
@@ -68,14 +69,17 @@ FRESH_BARS_MAP = {
 }
 FRESH_BARS_DEFAULT = 3
 
-# --- 分周期消息样式：用 emoji + 标签区分不同周期 ---
-# 一眼能分辨是短线（15m）/ 中线（1h）/ 主力（4h）信号
+# --- 分周期消息样式：emoji + 标签 + 色带 ---
+# 色带作用：在 TG 消息流中一眼分辨不同周期
+#   15m = 绿色（短线）🟢
+#   1h  = 蓝色（中线）🔵
+#   4h  = 红色（主力大指标，最醒目）🔴
 TF_STYLE_MAP = {
-    "15m": {"emoji": "⚡",  "tag": "短线"},
-    "1h":  {"emoji": "🎯",  "tag": "中线"},
-    "4h":  {"emoji": "💎",  "tag": "主力"},
+    "15m": {"emoji": "⚡",  "tag": "短线", "band": "🟢"},
+    "1h":  {"emoji": "🎯",  "tag": "中线", "band": "🔵"},
+    "4h":  {"emoji": "💎",  "tag": "主力", "band": "🔴"},
 }
-TF_STYLE_DEFAULT = {"emoji": "📊", "tag": ""}
+TF_STYLE_DEFAULT = {"emoji": "📊", "tag": "", "band": "⚪"}
 
 # --- 信号推送分级：>= MSG_TIER_STARS 的单独推；< 的合并成摘要 ---
 # 建议：4 = 只有 4~5 星单独推，1~3 星合并；5 = 只有 5 星单独推；0 = 所有单独推（旧行为）
@@ -514,6 +518,7 @@ def detect_divergence_signals(df, symbol, timeframe):
         tf_style = TF_STYLE_MAP.get(timeframe, TF_STYLE_DEFAULT)
         tf_emoji = tf_style["emoji"]
         tf_tag   = tf_style["tag"]
+        tf_band  = tf_style.get("band", "⚪")
         detail_line = {
             "DBL_BULL": f"Quantum + Flow 同时底背离",
             "DBL_BEAR": f"Quantum + Flow 同时顶背离",
@@ -525,12 +530,17 @@ def detect_divergence_signals(df, symbol, timeframe):
 
         tf_label = f"{tf_emoji} {tf_tag}·{timeframe}" if tf_tag else f"{tf_emoji} {timeframe}"
 
+        # v3.5 色带装饰：4h=红 / 1h=蓝 / 15m=绿，消息首尾各 10 个方块，醒目
+        band_line = tf_band * 10
+
         msg = (
+            f"{band_line}\n"
             f"{title_prefix} <b>[{tf_label}] {symbol} {title_cn}</b>\n"
             f"强度: {_stars_str(stars)}  ({ratio:.1f}x 阈值)\n"
             f"{detail_line}\n"
             f"新鲜度: {age} 根前 | 价: {curr_p:.6f}\n"
-            f"确认K线: {bar_t}"
+            f"确认K线: {bar_t}\n"
+            f"{band_line}"
         )
         log_row = {
             "symbol": symbol, "tf": timeframe, "sig_type": sig_type,
@@ -633,9 +643,16 @@ def _build_summary(timeframe, low_tier_rows):
     tf_style = TF_STYLE_MAP.get(timeframe, TF_STYLE_DEFAULT)
     tf_emoji = tf_style["emoji"]
     tf_tag   = tf_style["tag"]
+    tf_band  = tf_style.get("band", "⚪")
     tf_label = f"{tf_emoji} {tf_tag}·{timeframe}" if tf_tag else f"{tf_emoji} {timeframe}"
 
-    lines = [f"<b>📊 [{tf_label}] 摘要 | 本轮新增 {len(low_tier_rows)} 个低星级信号</b>"]
+    # v3.5 色带装饰：摘要消息首尾加色带
+    band_line = tf_band * 10
+
+    lines = [
+        band_line,
+        f"<b>📊 [{tf_label}] 摘要 | 本轮新增 {len(low_tier_rows)} 个低星级信号</b>",
+    ]
 
     def _fmt_group(title, rows):
         if not rows:
@@ -653,6 +670,7 @@ def _build_summary(timeframe, low_tier_rows):
 
     lines += _fmt_group("🔺 看涨", bulls)
     lines += _fmt_group("🔻 看跌", bears)
+    lines.append(band_line)
     return "\n".join(lines)
 
 
