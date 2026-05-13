@@ -11,6 +11,7 @@ Quantum Flow 背离侦察系统 v3.2
 - 失败合约自动退避（三振出局，冷藏 1 小时）
 - 分周期独立 FRESH_BARS 配置
 - v3.2 新增: 信号按强度分级推送（高星级单独推 + 低星级合并摘要）
+- v3.4 修复: (1) sent_signals.json 原子写入，防损坏 (2) 启动首轮静默，避免爆推
 """
 
 import ccxt
@@ -174,11 +175,14 @@ def _load_sent_signals():
 
 
 def _save_sent_signals():
+    # v3.4 原子写入：先写临时文件，再替换，防止写到一半崩溃/断电导致 JSON 损坏
     try:
         with _sent_lock:
             serializable = {"|".join(k): v for k, v in sent_signals.items()}
-        with open(SENT_SIGNALS_FILE, "w", encoding="utf-8") as f:
+        tmp_file = SENT_SIGNALS_FILE + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(serializable, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, SENT_SIGNALS_FILE)
     except Exception as e:
         print(f"  [WARN] 去重缓存保存失败: {e}")
 
@@ -805,7 +809,10 @@ def main():
         f"状态: 全市场扫描中..."
     )
 
-    last_run_times = {task['timeframe']: 0 for task in SCAN_TASKS}
+    # v3.4 启动首轮静默：用当前时间初始化，首次扫描会按正常节奏（等 interval_minutes 分钟后）触发
+    # 避免启动瞬间 3 个周期同时扫描、爆推一堆旧信号
+    _now_init = time.time()
+    last_run_times = {task['timeframe']: _now_init for task in SCAN_TASKS}
 
     print("\n" + "=" * 60)
     print("  Quantum Flow 背离侦察系统 v3.2 部署成功")
