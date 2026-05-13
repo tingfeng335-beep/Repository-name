@@ -415,9 +415,9 @@ def detect_divergence_signals(df, symbol, timeframe):
     for i in range(start, n):
         # ── Quantum 顶背离 ──
         if not np.isnan(f_ph_vals[i]):
-            pb = i - F_PR
+            pb = i
             pv = f_ph_vals[i]
-            pp = high_arr[pb] if pb >= 0 else high_arr[i]
+            pp = high_arr[pb]
             if not np.isnan(fh_v) and not np.isnan(fh_b):
                 amp = fh_v - pv
                 if pp >= fh_p and amp >= F_MD and (pb - fh_b) >= F_MB:
@@ -426,9 +426,9 @@ def detect_divergence_signals(df, symbol, timeframe):
 
         # ── Quantum 底背离 ──
         if not np.isnan(f_pl_vals[i]):
-            pb = i - F_PR
+            pb = i
             pv = f_pl_vals[i]
-            pp = low_arr[pb] if pb >= 0 else low_arr[i]
+            pp = low_arr[pb]
             if not np.isnan(fl_v) and not np.isnan(fl_b):
                 amp = pv - fl_v
                 if pp <= fl_p and amp >= F_MD and (pb - fl_b) >= F_MB:
@@ -437,9 +437,9 @@ def detect_divergence_signals(df, symbol, timeframe):
 
         # ── Flow 顶背离 ──
         if not np.isnan(m_ph_vals[i]):
-            pb = i - M_PR
+            pb = i
             pv = m_ph_vals[i]
-            pp = high_arr[pb] if pb >= 0 else high_arr[i]
+            pp = high_arr[pb]
             # 对齐 Pine ta.highest/ta.lowest(high, m_pl*3)：取最近 M_PL*3 根 K（含当前）
             lookback = M_PL * 3
             start_k  = max(0, i - lookback + 1)
@@ -454,9 +454,9 @@ def detect_divergence_signals(df, symbol, timeframe):
 
         # ── Flow 底背离 ──
         if not np.isnan(m_pl_vals[i]):
-            pb = i - M_PR
+            pb = i
             pv = m_pl_vals[i]
-            pp = low_arr[pb] if pb >= 0 else low_arr[i]
+            pp = low_arr[pb]
             # 对齐 Pine ta.highest/ta.lowest(high, m_pl*3)：取最近 M_PL*3 根 K（含当前）
             lookback = M_PL * 3
             start_k  = max(0, i - lookback + 1)
