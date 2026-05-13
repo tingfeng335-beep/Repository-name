@@ -46,7 +46,7 @@ TOP_N               = 200
 MARKETS_CACHE_TTL   = 3600      # 合约列表缓存 1 小时
 
 # --- 并发设置 ---
-SCAN_WORKERS        = 10        # 并发线程数（Binance 限速建议不超过 20）
+SCAN_WORKERS        = 20        # 并发线程数（提速：10→20，仍远低于 Binance 2400/分钟限制）
 
 # --- 枢轴与背离参数 ---
 F_PL = 5;   F_PR = 3;   F_MB = 8;   F_MD = 3.0
