@@ -13,7 +13,7 @@ BOTS = {
     "默认机器人 (1h/4h/系统通知)":
         "8597069493:AAEmXzUJ3Yv42NGd2EsP3M93aatLjqzPWFI",
     "第一机器人 (15m)":
-        "8536181331:AAGPI90prRZLsZ5IP-fumytpviwVfWCC3z4",
+        "8536181331:AAF2KZXP8gn9dkH_lubHu3EFFB3uniE3Mjc",
 }
 CHAT_IDS = {
     "你自己":           "7470996017",

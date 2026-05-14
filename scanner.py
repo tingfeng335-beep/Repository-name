@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 TG_TOKEN           = os.getenv("TG_TOKEN",           "8597069493:AAEmXzUJ3Yv42NGd2EsP3M93aatLjqzPWFI")
 # v3.8 多机器人分流：第一个机器人专门收 15m 信号
 # 用法：在 BotFather 拿到 token 填这里；接收人需先在 TG 给该机器人发 /start，否则推不过去
-TG_TOKEN_15M       = os.getenv("TG_TOKEN_15M",       "8536181331:AAGPI90prRZLsZ5IP-fumytpviwVfWCC3z4")
+TG_TOKEN_15M       = os.getenv("TG_TOKEN_15M",       "8536181331:AAF2KZXP8gn9dkH_lubHu3EFFB3uniE3Mjc")
 
 # 多用户推送：把需要接收的 chat_id 写进列表里即可；脚本会逐个推送
 TG_CHAT_IDS        = [
