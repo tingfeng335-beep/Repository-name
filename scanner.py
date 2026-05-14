@@ -811,7 +811,7 @@ def _scan_one(exchange, symbol, timeframe):
     """
     # v3.7 拉 500 根 K（原 200）：让 rolling(50).std / rolling(60).mean / ewm 充分预热
     # 修幽灵背离：避免在 fusion_d/mf 还不稳定的前 60 根里找到"假枢轴"
-    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=500)
+    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=1000)
     if len(bars) < 200:
         return symbol, []
 
