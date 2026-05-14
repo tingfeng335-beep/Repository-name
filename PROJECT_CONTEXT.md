@@ -21,13 +21,13 @@
 
 ## 二、当前版本
 
-**v3.6**（commit 待填，PR 待开）
+**v3.9**（commit `609f3ad`，已合并到 main）
 
-**分支**：`optimize/scanner-v1`（所有 PR 合并到这里）
+**正式分支**：`main`（v3.9 起所有 PR 合并到这里。旧的 `optimize/scanner-v1` 已废弃）
 
 下载命令：
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/tingfeng335-beep/Repository-name/optimize/scanner-v1/scanner.py" -OutFile "C:\Users\Administrator\scanner.py"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/tingfeng335-beep/Repository-name/main/scanner.py" -OutFile "C:\Users\Administrator\scanner.py"
 ```
 
 ---
@@ -82,7 +82,7 @@ DAILY_REPORT_HOUR_UTC    = 0     # 日报 UTC 0 点
 
 > 📋 **每次改代码都必须在这里加一条记录**。格式：版本号、commit、分支/PR、改了什么、为什么、风险。
 
-### v3.9（2026-05-14，分支 `fix/v3.9-robustness`，PR 待开）
+### v3.9（2026-05-14，分支 `fix/v3.9-robustness`，PR #6 → 已合并到 `main`，commit `609f3ad`）
 **改动**：6 项健壮性强化（用户 P0+P1 全打包）
 
 1. **`signals.log` 按月切**
@@ -347,7 +347,7 @@ del sent_signals.json
 
 ### 下载最新版
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/tingfeng335-beep/Repository-name/optimize/scanner-v1/scanner.py" -OutFile "C:\Users\Administrator\scanner.py"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/tingfeng335-beep/Repository-name/main/scanner.py" -OutFile "C:\Users\Administrator\scanner.py"
 ```
 
 ### 检查本地版本
@@ -359,13 +359,14 @@ Get-Content C:\Users\Administrator\scanner.py | Select-String "v3\."
 
 ## 十、Git 工作流（必须遵守）
 
-1. **永远不要直接提交到 `optimize/scanner-v1`**（用户的主分支）
+1. **永远不要直接提交到 `main`**（v3.9 起的正式分支；旧 `optimize/scanner-v1` 已废弃）
 2. **每次改动开新分支**：
-   - 修 Bug：`fix/vX.Y-描述`（如 `fix/v3.4-safety`）
-   - 加功能：`feat/vX.Y-描述`（如 `feat/v3.5-color-bands`）
-3. **开 PR 让用户审阅**，合并到 `optimize/scanner-v1`
-4. **commit message 带版本号**：`fix(v3.4): ...` / `feat(v3.5): ...`
+   - 修 Bug：`fix/vX.Y-描述`（如 `fix/v3.9-robustness`）
+   - 加功能：`feat/vX.Y-描述`（如 `feat/v3.8-multi-bot-routing`）
+3. **开 PR 让用户审阅**，合并到 `main`
+4. **commit message 带版本号**：`fix(v3.9): ...` / `feat(v3.8): ...`
 5. **每次改完必须更新本文档的"五、更新日志"**
+6. **合并完成后**：测试分支可以删掉（GitHub UI 一键），代码已经都在 main 里了
 
 ---
 
