@@ -1024,6 +1024,24 @@ def main():
         f"状态: 全市场扫描中..."
     )
 
+    # v3.8 给每个非默认机器人也单独发一条"就位"消息，让用户能立刻确认它活着
+    # （否则要等真出现 15m 信号才能验证，可能要几小时）
+    _seen_tokens = {TG_TOKEN}
+    for _tf, _tok in TG_TOKEN_BY_TF.items():
+        if _tok and _tok not in _seen_tokens:
+            _seen_tokens.add(_tok)
+            _style = TF_STYLE_MAP.get(_tf, TF_STYLE_DEFAULT)
+            _band = _style.get("band", "⚪") * 10
+            send_tg(
+                f"{_band}\n"
+                f"{_style['emoji']} <b>[{_tf} 专用机器人] 就位</b>\n"
+                f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"职责: 推送 {_tf} 周期的所有背离信号\n"
+                f"状态: 等待第一轮扫描 (约 {next((t['interval_minutes'] for t in SCAN_TASKS if t['timeframe']==_tf), 3)} 分钟)...\n"
+                f"{_band}",
+                timeframe=_tf
+            )
+
     # v3.4 启动首轮静默：用当前时间初始化，首次扫描会按正常节奏（等 interval_minutes 分钟后）触发
     # 避免启动瞬间 3 个周期同时扫描、爆推一堆旧信号
     _now_init = time.time()
