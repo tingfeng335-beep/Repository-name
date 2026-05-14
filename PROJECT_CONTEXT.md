@@ -82,6 +82,32 @@ DAILY_REPORT_HOUR_UTC    = 0     # 日报 UTC 0 点
 
 > 📋 **每次改代码都必须在这里加一条记录**。格式：版本号、commit、分支/PR、改了什么、为什么、风险。
 
+### v3.8（2026-05-14，分支 `feat/v3.8-multi-bot-routing`，PR 待开）
+**改动**：多机器人分流推送
+1. **新增第二个机器人 token** `TG_TOKEN_15M`（默认值 = 用户的"第一机器人" token）
+2. **新增路由表** `TG_TOKEN_BY_TF = {"15m": TG_TOKEN_15M, "1h": TG_TOKEN, "4h": TG_TOKEN}`
+3. **`send_tg()` 增加可选参数 `timeframe=None`**，按周期挑 token；不传走默认 TG_TOKEN
+4. **`scan_markets()`** 推送时把 `timeframe` 传进 `send_tg`（高星单推 + 低星摘要都带）
+5. **系统通知**（启动 / 心跳 / 日报 / 崩溃）不传 timeframe → 全部走默认机器人，行为不变
+
+**为什么**：用户希望 15m 信号噪音不要污染主频道，让 1h/4h 主力信号更醒目。
+
+**收件人**：`TG_CHAT_IDS` 没改，两个机器人都推给同一批人（用户 + 朋友 @Nick_Tuz）。
+
+**重要前置**：朋友必须先在 TG 里给"第一机器人"主动发 `/start`，否则 TG API 会返回
+`Forbidden: bot can't initiate conversation with a user`，第一机器人对他推不出去（用户自己能收到）。
+
+**未动**：
+- `calculate_quantum_flow` 一行不改 ✅
+- `detect_divergence_signals` 不改 ✅
+- 强度评分 / 新鲜度 / 去重 / 失败退避 / 心跳 / 日报 / 崩溃通知 全部不改 ✅
+- 配置可被环境变量覆盖：`TG_TOKEN` / `TG_TOKEN_15M`
+
+**风险**：
+- 朋友没给第一机器人 `/start` → 朋友收不到 15m（日志里会有 `bot can't initiate conversation` warn）
+- 第一机器人 token 失效 → 15m 推送失败、1h/4h 不受影响
+- 没有破坏性改动；启动通知里加了一行"机器人路由"提示
+
 ### v3.7（2026-05-13，分支 `fix/v3.7-ghost-divergence`，PR 待开）
 **改动**（3 行核心修改）：
 1. **拉 K 线数**: 200 → **500**（让 rolling(50).std / rolling(60).mean / ewm 充分预热）

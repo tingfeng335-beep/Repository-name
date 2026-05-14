@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quantum Flow 背离侦察系统 v3.2
+Quantum Flow 背离侦察系统 v3.8
 - 按 Binance USDT 永续合约 24h 成交额降序取前 TOP_N 个扫描
 - 严格排除交割合约、USDC 计价合约
 - 并发扫描（线程池），单周期扫描提速 3~5 倍
@@ -15,6 +15,7 @@ Quantum Flow 背离侦察系统 v3.2
 - v3.5 新增: (1) 4h 扫描提速 60→20 分钟 (2) 分周期色带 4h红/1h蓝/15m绿，醒目区分
 - v3.6 新增: (1) TOP_N 230→190 (2) 心跳消息(每6h) (3) 崩溃通知 (4) 每日日报(UTC 0点)
 - v3.7 修复: 幽灵背离 — 拉 K 线数 200→500 + 枢轴扫描起点 +20→+50，避免在指标未预热区间找假枢轴
+- v3.8 新增: 多机器人分流推送 — 15m 信号走"第一个机器人"，1h/4h/系统通知走默认机器人
 """
 
 import ccxt
@@ -35,11 +36,22 @@ from datetime import datetime, timezone
 # ==============================================================================
 
 TG_TOKEN           = os.getenv("TG_TOKEN",           "8597069493:AAEmXzUJ3Yv42NGd2EsP3M93aatLjqzPWFI")
+# v3.8 多机器人分流：第一个机器人专门收 15m 信号
+# 用法：在 BotFather 拿到 token 填这里；接收人需先在 TG 给该机器人发 /start，否则推不过去
+TG_TOKEN_15M       = os.getenv("TG_TOKEN_15M",       "8536181331:AAGPI90prRZLsZ5IP-fumytpviwVfWCC3z4")
+
 # 多用户推送：把需要接收的 chat_id 写进列表里即可；脚本会逐个推送
 TG_CHAT_IDS        = [
     "7470996017",    # 你自己
     "6587035253",    # 癫皇比特币 @Nick_Tuz
 ]
+
+# v3.8 按周期路由到不同机器人；未列出的周期 / 系统消息（启动/心跳/日报/崩溃）走 TG_TOKEN
+TG_TOKEN_BY_TF = {
+    "15m": TG_TOKEN_15M,
+    "1h":  TG_TOKEN,
+    "4h":  TG_TOKEN,
+}
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY",    "LmoOgqAkSmcpilfJcdEW4genLy76swigcTnIMPVR7gvqwR55aY4lxjdJbigzeKY8")
 BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY", "aErEwJ3gOvBr6mS92zOaJ9mhbBqeors2WXp7nFESyZaJQ2e38giKwWr0NMAXofJI")
 
@@ -112,11 +124,15 @@ _NO_PROXY = {"http": None, "https": None}
 _tg_lock = threading.Lock()   # 并发环境下串行化 TG 发送，避免触发 429
 
 
-def send_tg(message, retries=3):
+def send_tg(message, retries=3, timeframe=None):
     """发送战报至 Telegram，失败指数退避重试（线程安全）
     对 TG_CHAT_IDS 里的每个用户逐一推送，任一用户发送成功即视为 True
+
+    v3.8: 按 timeframe 路由到不同机器人；timeframe=None 走默认 TG_TOKEN
+    （启动通知 / 心跳 / 日报 / 崩溃通知都不传 timeframe，走默认机器人）
     """
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    token = TG_TOKEN_BY_TF.get(timeframe, TG_TOKEN) if timeframe else TG_TOKEN
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
 
     with _tg_lock:
         any_ok = False
@@ -797,7 +813,7 @@ def scan_markets(exchange, timeframe):
         # 1. 高星级 / 双背离：单独推
         sent_high = 0
         for msg, log_row in high_tier_queue:
-            ok = send_tg(msg)
+            ok = send_tg(msg, timeframe=timeframe)
             sent_high += 1 if ok else 0
             tag = 'OK' if ok else 'FAIL'
             tg_logs.append(
@@ -808,7 +824,7 @@ def scan_markets(exchange, timeframe):
         summary = _build_summary(timeframe, low_tier_queue)
         sent_summary = False
         if summary:
-            sent_summary = send_tg(summary)
+            sent_summary = send_tg(summary, timeframe=timeframe)
             tag = 'OK' if sent_summary else 'FAIL'
             tg_logs.append(f"  [{tag}] [摘要] {timeframe} 合并 {len(low_tier_queue)} 条低星级")
 
@@ -993,7 +1009,7 @@ def main():
     interval_desc = " / ".join(f"{t['timeframe']}:{t['interval_minutes']}分"
                                for t in SCAN_TASKS)
     send_tg(
-        f"<b>Quantum Flow 背离侦察系统 v3.2 启动</b>\n"
+        f"<b>Quantum Flow 背离侦察系统 v3.8 启动</b>\n"
         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"监控周期: 15m / 1h / 4h\n"
         f"扫描频率: {interval_desc}\n"
@@ -1002,6 +1018,7 @@ def main():
         f"新鲜度: {fresh_desc}\n"
         f"失败退避: 连续 {FAIL_STRIKE_LIMIT} 次 → 冷藏 {COOLDOWN_SECONDS // 60} 分钟\n"
         f"推送分级: ≥ {MSG_TIER_STARS}★ 单独推 / &lt; {MSG_TIER_STARS}★ 合并摘要\n"
+        f"机器人路由: 15m → 第一机器人 / 1h·4h·系统通知 → 默认机器人\n"
         f"监控: 💓 心跳每{HEARTBEAT_INTERVAL_HOURS}h / 📅 日报UTC 0点 / 🚨 崩溃自动通知\n"
         f"信号: Quantum/Flow 背离 (带强度星级)\n"
         f"状态: 全市场扫描中..."
@@ -1019,7 +1036,7 @@ def main():
     last_daily_date     = datetime.now(timezone.utc).date()   # 启动当天不发日报，避免重启刷屏
 
     print("\n" + "=" * 60)
-    print("  Quantum Flow 背离侦察系统 v3.2 部署成功")
+    print("  Quantum Flow 背离侦察系统 v3.8 部署成功")
     print("=" * 60 + "\n")
 
     while True:
