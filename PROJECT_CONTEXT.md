@@ -21,7 +21,7 @@
 
 ## 二、当前版本
 
-**v3.9**（commit `609f3ad`，已合并到 main）
+**v3.10**（commit 待填，分支 `fix/v3.10-pine-alignment`）
 
 **正式分支**：`main`（v3.9 起所有 PR 合并到这里。旧的 `optimize/scanner-v1` 已废弃）
 
@@ -69,18 +69,74 @@ DAILY_REPORT_HOUR_UTC    = 0     # 日报 UTC 0 点
 
 ---
 
-## 四、核心指标逻辑（**永远不能改**）
+## 四、核心指标逻辑（**严格对齐 Pine 真理源，不可凭空改动**）
 
-`calculate_quantum_flow()` 函数 —— 严格复刻 Pine Script，任何人都不要动：
+`calculate_quantum_flow()` 函数 —— 严格复刻 Pine Script `Quantum Flow Cipher`（你朋友写的）：
 - Delta Volume / CVD 动量 / MACD / 归一化 / ATR 加权 / Fusion 融合 / Money Flow
 
 `detect_pivots()` —— 严格对齐 Pine `ta.pivothigh/pivotlow`：**两侧都用严格 `>` / `<`**。
+
+⚠️ **铁律**：这两个函数的算法**不可凭空改动**（不能加趋势过滤、不能换阈值、不能改公式）。
+**唯一例外**：发现 Python 实现和 Pine 真理源有数学偏差时，可以也应该向 Pine 对齐
+（如 v3.10 修了 std/atr/clip 三处对齐 Pine `ta.stdev` `ta.atr` `math.max` 的细节）。
+对齐 Pine 不算违反铁律——本质是修 Bug。
+
+**原版 Pine 代码**：用户朋友写的，详见对话记录或 `docs/quantum_flow_cipher.pine`（如有）。
 
 ---
 
 ## 五、更新日志（最新的在上）
 
 > 📋 **每次改代码都必须在这里加一条记录**。格式：版本号、commit、分支/PR、改了什么、为什么、风险。
+
+### v3.10（2026-05-14，分支 `fix/v3.10-pine-alignment`，PR 待开）
+**改动**：3 处 Pine 数学对齐（让 Python 严格 = TV 上你朋友写的 Quantum Flow Cipher）
+
+**背景**：用户提供了原版 Pine 代码 `Quantum Flow Cipher`（v5）。逐行对照 v3.9 的
+`calculate_quantum_flow` 实现，发现 3 处微小数学偏差，是部分"幽灵背离"的根因之一：
+
+1. **`std()` → `std(ddof=0)`** （2 处：macd_std, cvd_std）
+   - Pine 的 `ta.stdev` 用**总体标准差**（÷N）
+   - pandas 的 `.std()` 默认**样本标准差**（÷N-1，ddof=1）
+   - N=50 时差 ~1%，刚好踩 `F_MD=3.0` σ 阈值的背离会"忽通忽不通"
+
+2. **ATR 平滑：`rolling(14).mean()` → `ewm(alpha=1/14, adjust=False).mean()`**
+   - Pine 的 `ta.atr(14)` 用 **Wilder's RMA**（EMA，α=1/14）
+   - 之前用 SMA(14)，与 Pine 偏差 ~5%
+   - ATR → vr → mw（融合权重），间接影响 fusion_d
+
+3. **下界保护：`.replace(0, 1e-6)` → `.clip(lower=1e-6)`**（4 处）
+   - Pine 的 `math.max(stdev, 1e-6)` 保证下界 ≥ 1e-6
+   - 之前 `.replace(0, 1e-6)` 只在数值**等于 0** 时替换，
+     若数值是 1e-9（极小但非 0），分母仍然爆炸 → 归一化值飞天 → 假枢轴
+   - 改成 `.clip(lower=1e-6)` 后任何小于 1e-6 的值都会被拔到 1e-6
+
+**总改动**：29 行（+18 / -11），全部在 `calculate_quantum_flow` 函数内 + 文档注释。
+**v3.9 之前的所有改动一字未动**（多机器人路由 / 健壮性 / 推送 / 监控 等等）。
+
+**为什么这次"违反"了核心算法不动的铁律？**
+铁律的本意是"不要凭空发挥"（不要加 RSI 过滤、不要改阈值、不要换公式）。
+v3.10 不是凭空改算法，**是在修 Pine→Python 翻译时的数学 Bug**——
+Pine 才是真理源，Python 应该对齐 Pine 而不是反过来。
+本次更新已把铁律放宽明确写进"四、核心指标逻辑"。
+
+**未做（用户暂不需要）**：
+- ❌ Pine 里有的 **Level3 吸筹/出货** 信号（约 30 行可加，目前用户没说要）
+- ❌ Pine 里有的**双背离共振**（用户之前已明确禁用）
+
+**API 影响**：0（纯数学，不增加任何 API 调用）
+
+**风险**：极低
+- 改动机械式简单（3 处字面替换）
+- 信号语义没动（仍然是 Quantum/Flow 各自找枢轴 + 阈值过滤）
+- fusion_d 数值会有 ±1~5% 微小变化，可能让某些"踩线"信号变化通过/不通过
+- v3.7 拉的 500 根 K 线足够让 RMA(14) 充分预热（500 ≫ 5×14）
+
+**预期效果**：
+- 长期看，Python 推送和 Pine 画线的一致度会提升（"幽灵背离"概率下降）
+- 但仍不可能 100% 一致（TV CVD 从合约上市累加几万根，Python 只 500 根）
+
+---
 
 ### v3.9（2026-05-14，分支 `fix/v3.9-robustness`，PR #6 → 已合并到 `main`，commit `609f3ad`）
 **改动**：6 项健壮性强化（用户 P0+P1 全打包）
