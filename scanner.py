@@ -1095,7 +1095,7 @@ def main():
     interval_desc = " / ".join(f"{t['timeframe']}:{t['interval_minutes']}分"
                                for t in SCAN_TASKS)
     send_tg(
-        f"<b>Quantum Flow 背离侦察系统 v3.10 启动</b>\n"
+        f"<b>Quantum Flow 背离侦察系统 v3.11 启动</b>\n"
         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"监控周期: 15m / 1h / 4h\n"
         f"扫描频率: {interval_desc}\n"
@@ -1148,7 +1148,7 @@ def main():
     last_daily_date     = datetime.now(timezone.utc).date()   # 启动当天不发日报，避免重启刷屏
 
     print("\n" + "=" * 60)
-    print("  Quantum Flow 背离侦察系统 v3.10 部署成功")
+    print("  Quantum Flow 背离侦察系统 v3.11 部署成功")
     print(f"  日志路径: {SIGNALS_LOG_DIR}")
     print(f"  当月日志: {os.path.basename(_signals_log_path_for_now())}")
     print(f"  去重缓存: {SENT_SIGNALS_FILE}")
