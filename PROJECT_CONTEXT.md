@@ -82,6 +82,67 @@ DAILY_REPORT_HOUR_UTC    = 0     # 日报 UTC 0 点
 
 > 📋 **每次改代码都必须在这里加一条记录**。格式：版本号、commit、分支/PR、改了什么、为什么、风险。
 
+### v3.9（2026-05-14，分支 `fix/v3.9-robustness`，PR 待开）
+**改动**：6 项健壮性强化（用户 P0+P1 全打包）
+
+1. **`signals.log` 按月切**
+   - 每月一个文件 `signals_YYYY-MM.log`，避免长跑膨胀（一年下来几百 MB）
+   - `_read_signals_last_hours()` 改成扫所有月份文件 + 旧 `signals.log`（向后兼容）
+   - 日报跨月时自动合并，对用户透明
+
+2. **持久化文件锚定到脚本所在目录**
+   - `SENT_SIGNALS_FILE` 和日志目录都用 `os.path.dirname(os.path.abspath(__file__))`
+   - 修复：从其他工作目录启动 `python /xxx/scanner.py` 时找不到去重缓存、爆推一堆旧信号
+
+3. **ccxt 加 `timeout=10000ms`**
+   - 默认 30 秒，单个币卡顿会拖慢整轮扫描
+   - 10 秒内不响应就抛错 → 走失败重试 + 退避机制
+   - 启动消息里增加 `API 超时: 10000ms` 显示
+
+4. **TG 锁按 token 拆分**
+   - 之前 `_tg_lock` 全局一把锁，两个机器人同时推会串行
+   - 改成 `dict[token, Lock]`，懒创建：第一次访问该 token 才创建锁
+   - 多机器人推送速度 ~2x（每条仍然单线程，但不同 token 之间并行）
+
+5. **失败合约短期跳过（指数退避）**
+   - 之前：1~2 次失败仍每轮重试（同一坏币会反复抽风）
+   - 现在：第 N 次失败 → 跳过 N×60 秒（最多 5 分钟）；第 3 次才进 1 小时长期冷藏
+   - `is_cold()` 同时检查 `cold_until` 和 `next_retry_at` 两个字段
+   - 新增配置 `SHORT_RETRY_BASE=60`、`SHORT_RETRY_MAX=300`
+
+6. **启动错峰首扫（不再哑静 31 分钟）**
+   - 之前 v3.4 启动首轮静默：所有周期等 `interval_minutes` 后才扫
+   - 实测：4h 周期重启后要等 20 分钟才跑第一次，对用户太长
+   - 现在：把 `last_run_times` 提前到"过去"，让 main loop 在
+     30/45/60 秒后分别触发 15m/1h/4h 首扫（错峰避免三周期撞 API）
+   - 新增配置 `STARTUP_FIRST_RUN_DELAYS = {"15m": 30, "1h": 45, "4h": 60}`
+   - 不会爆推：`should_send` 去重缓存仍然生效，已推过的信号不会重复
+
+**未做（用户撤回的 ⑦）**：
+- ⑦ 删除 `co_fresh` 死代码 —— 用户改主意撤回了
+
+**未动**：
+- `calculate_quantum_flow` 一行不改 ✅
+- `detect_divergence_signals` 不改 ✅
+- 多机器人路由 / 强度评分 / 新鲜度 / 推送分级 / 心跳 / 日报 / 崩溃通知 全部不改 ✅
+- 配置全部可被环境变量覆盖（TG_TOKEN / TG_TOKEN_15M / API key 等）
+
+**新增配置常量**：
+- `CCXT_TIMEOUT_MS=10000`
+- `STARTUP_FIRST_RUN_DELAYS={"15m":30, "1h":45, "4h":60}`
+- `SHORT_RETRY_BASE=60`, `SHORT_RETRY_MAX=300`
+
+**风险**：
+- 启动错峰：30 秒后就有第一轮 15m，但 `should_send` 去重缓存会过滤已推信号，不会爆推
+- 按月切日志：第一次升级会自动新建 `signals_YYYY-MM.log`，旧 `signals.log` 仍能被读取
+- ccxt timeout：可能比之前更早进失败重试（但短期跳过 1 分钟即可恢复）
+- TG 锁拆分：纯线程安全改动，逻辑等价
+
+**首次升级注意**：
+- 旧 `signals.log` 会保留并继续被日报读取（向后兼容）
+- 新信号会写入 `signals_YYYY-MM.log`（按月）
+- 用户不需要手动迁移
+
 ### v3.8（2026-05-14，分支 `feat/v3.8-multi-bot-routing`，PR #5，**待合并**）
 **改动**：多机器人分流推送
 

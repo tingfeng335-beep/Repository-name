@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quantum Flow 背离侦察系统 v3.8
+Quantum Flow 背离侦察系统 v3.9
 - 按 Binance USDT 永续合约 24h 成交额降序取前 TOP_N 个扫描
 - 严格排除交割合约、USDC 计价合约
 - 并发扫描（线程池），单周期扫描提速 3~5 倍
@@ -16,6 +16,13 @@ Quantum Flow 背离侦察系统 v3.8
 - v3.6 新增: (1) TOP_N 230→190 (2) 心跳消息(每6h) (3) 崩溃通知 (4) 每日日报(UTC 0点)
 - v3.7 修复: 幽灵背离 — 拉 K 线数 200→500 + 枢轴扫描起点 +20→+50，避免在指标未预热区间找假枢轴
 - v3.8 新增: 多机器人分流推送 — 15m 信号走"第一个机器人"，1h/4h/系统通知走默认机器人
+- v3.9 健壮性强化:
+  ① signals.log 按月切（signals_YYYY-MM.log），日报跨月自动合并最近两个月
+  ② 持久化文件锚定到脚本所在目录，无论从哪里启动都能找到
+  ③ ccxt 加 timeout=10000ms，避免单个币卡住整轮扫描
+  ④ TG 锁按 token 拆分，多机器人推送可并行（推送速度 ~2x）
+  ⑤ 失败合约短期跳过（1/2/3 分钟指数退避），三振才进 1 小时冷藏
+  ⑥ 启动后 30/45/60 秒内三个周期分别跑一次，不再哑静 31 分钟
 """
 
 import ccxt
@@ -26,6 +33,7 @@ import time
 import os
 import sys
 import json
+import glob
 import atexit
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -62,12 +70,23 @@ SCAN_TASKS = [
     {"timeframe": "4h",  "interval_minutes": 20},
 ]
 
+# --- v3.9 启动错峰：启动后 N 秒内分别给三个周期跑一次（避免哑静期） ---
+# 错开是为了首次启动时三个周期不同时撞 Binance/TG，平滑负载
+STARTUP_FIRST_RUN_DELAYS = {
+    "15m": 30,    # 启动 30 秒后跑第一次 15m
+    "1h":  45,    # 启动 45 秒后跑第一次 1h
+    "4h":  60,    # 启动 60 秒后跑第一次 4h
+}
+
 # --- 合约池设置：按 24h 成交额降序取前 TOP_N 个 ---
 TOP_N               = 190
 MARKETS_CACHE_TTL   = 3600      # 合约列表缓存 1 小时
 
 # --- 并发设置 ---
 SCAN_WORKERS        = 20        # 并发线程数（提速：10→20，仍远低于 Binance 2400/分钟限制）
+
+# --- v3.9 ccxt 超时（毫秒），防止单个币卡住整轮 ---
+CCXT_TIMEOUT_MS     = 10000     # 10 秒，超时进重试 + 三振冷藏机制
 
 # --- 枢轴与背离参数 ---
 F_PL = 5;   F_PR = 3;   F_MB = 8;   F_MD = 3.0
@@ -99,13 +118,26 @@ TF_STYLE_DEFAULT = {"emoji": "📊", "tag": "", "band": "⚪"}
 # 建议：4 = 只有 4~5 星单独推，1~3 星合并；5 = 只有 5 星单独推；0 = 所有单独推（旧行为）
 MSG_TIER_STARS      = 4
 
-# --- 失败合约退避 ---
-FAIL_STRIKE_LIMIT = 3             # 连续失败多少次进入冷藏
-COOLDOWN_SECONDS  = 60 * 60       # 冷藏时长（秒）= 1 小时
+# --- 失败合约退避（v3.9 强化：单次失败也短暂跳过）---
+FAIL_STRIKE_LIMIT = 3             # 连续失败多少次进入长期冷藏
+COOLDOWN_SECONDS  = 60 * 60       # 长期冷藏时长（秒）= 1 小时
+SHORT_RETRY_BASE  = 60            # 短期跳过基数：失败 N 次后跳过 N×60 秒（最多 SHORT_RETRY_MAX）
+SHORT_RETRY_MAX   = 300           # 短期跳过上限 = 5 分钟
 
-# --- 持久化文件 ---
-SENT_SIGNALS_FILE  = "sent_signals.json"
-SIGNALS_LOG_FILE   = "signals.log"
+# --- v3.9 持久化文件：锚定到脚本所在目录，避免相对路径问题 ---
+# （之前用相对路径，从不同目录启动会找不到 sent_signals.json，导致爆推一堆旧信号）
+_SCRIPT_DIR        = os.path.dirname(os.path.abspath(__file__))
+SENT_SIGNALS_FILE  = os.path.join(_SCRIPT_DIR, "sent_signals.json")
+
+# --- v3.9 signals.log 按月切，避免长跑膨胀 ---
+# 文件名: signals_YYYY-MM.log（每月一个文件）
+# 旧的 signals.log 会被自动当成"无月份归档"读取（向后兼容）
+SIGNALS_LOG_DIR    = _SCRIPT_DIR
+SIGNALS_LOG_LEGACY = os.path.join(_SCRIPT_DIR, "signals.log")    # 旧格式，向后兼容
+
+def _signals_log_path_for_now():
+    """当月日志文件路径，每月自动滚动"""
+    return os.path.join(SIGNALS_LOG_DIR, f"signals_{datetime.now(timezone.utc).strftime('%Y-%m')}.log")
 
 # --- 去重记录保留时长（毫秒） ---
 SIGNAL_RETENTION_MS = 3 * 24 * 3600 * 1000    # 3 天
@@ -121,7 +153,20 @@ DAILY_REPORT_HOUR_UTC    = 0     # 日报推送时刻（UTC 0 点）
 # 禁用系统代理，避免 Windows 代理设置导致 requests 卡死
 _NO_PROXY = {"http": None, "https": None}
 
-_tg_lock = threading.Lock()   # 并发环境下串行化 TG 发送，避免触发 429
+# v3.9 TG 锁按 token 拆分 —— 不同机器人是独立 API，可以并行推
+# （之前全局一把锁，两个机器人同时推会串行排队）
+_tg_locks_dict_lock = threading.Lock()    # 保护下面这个 dict 本身
+_tg_locks = {}                             # token -> threading.Lock()
+
+
+def _get_tg_lock(token):
+    """按 token 拿锁，没有就懒创建（线程安全）"""
+    with _tg_locks_dict_lock:
+        lock = _tg_locks.get(token)
+        if lock is None:
+            lock = threading.Lock()
+            _tg_locks[token] = lock
+        return lock
 
 
 def send_tg(message, retries=3, timeframe=None):
@@ -130,11 +175,12 @@ def send_tg(message, retries=3, timeframe=None):
 
     v3.8: 按 timeframe 路由到不同机器人；timeframe=None 走默认 TG_TOKEN
     （启动通知 / 心跳 / 日报 / 崩溃通知都不传 timeframe，走默认机器人）
+    v3.9: 锁按 token 拆分 —— 不同机器人推送可并行
     """
     token = TG_TOKEN_BY_TF.get(timeframe, TG_TOKEN) if timeframe else TG_TOKEN
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-    with _tg_lock:
+    with _get_tg_lock(token):    # v3.9: 只锁这个 token 自己的发送队列
         any_ok = False
         for chat_id in TG_CHAT_IDS:
             payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
@@ -228,21 +274,32 @@ def should_send(symbol, tf, sig_type, bar_time_ms):
 
 
 # ==============================================================================
-# 4. 【失败合约退避】
+# 4. 【失败合约退避】(v3.9 加强：单次失败也短期跳过，三振才长期冷藏)
 # ==============================================================================
 
 _strike_lock = threading.Lock()
-# key: (symbol, timeframe) -> {"fails": 连续失败次数, "cold_until": 解冻时间戳}
+# key: (symbol, timeframe) -> {
+#   "fails": 连续失败次数,
+#   "next_retry_at": 下次允许重试的时间戳（短期跳过用）,
+#   "cold_until": 长期冷藏到期时间戳（三振后用）,
+# }
 _symbol_strikes = {}
 
 
 def is_cold(symbol, tf):
-    """检查合约是否处于冷藏期"""
+    """检查合约是否处于冷藏期或短期跳过期"""
     with _strike_lock:
         rec = _symbol_strikes.get((symbol, tf))
         if not rec:
             return False
-        return rec.get("cold_until", 0) > time.time()
+        now = time.time()
+        # 长期冷藏（三振后）
+        if rec.get("cold_until", 0) > now:
+            return True
+        # v3.9 新增：短期跳过（单次/双次失败后）
+        if rec.get("next_retry_at", 0) > now:
+            return True
+        return False
 
 
 def record_success(symbol, tf):
@@ -252,15 +309,25 @@ def record_success(symbol, tf):
 
 
 def record_failure(symbol, tf):
-    """记录一次失败；达到阈值则冷藏"""
+    """记录一次失败；
+    - 1~(LIMIT-1) 次：短期跳过 N×60 秒（最多 SHORT_RETRY_MAX=5 分钟）
+    - 第 LIMIT 次：进入长期冷藏 1 小时
+    返回 True 表示触发了长期冷藏（用于日志）
+    """
     with _strike_lock:
-        rec = _symbol_strikes.get((symbol, tf), {"fails": 0, "cold_until": 0})
+        rec = _symbol_strikes.get((symbol, tf), {"fails": 0, "next_retry_at": 0, "cold_until": 0})
         rec["fails"] += 1
+        now = time.time()
         if rec["fails"] >= FAIL_STRIKE_LIMIT:
-            rec["cold_until"] = time.time() + COOLDOWN_SECONDS
+            # 三振：长期冷藏
+            rec["cold_until"] = now + COOLDOWN_SECONDS
             rec["fails"] = 0
+            rec["next_retry_at"] = 0
             _symbol_strikes[(symbol, tf)] = rec
-            return True   # 触发冷藏
+            return True
+        # v3.9 单次/双次失败：短期跳过 N 分钟
+        backoff = min(rec["fails"] * SHORT_RETRY_BASE, SHORT_RETRY_MAX)
+        rec["next_retry_at"] = now + backoff
         _symbol_strikes[(symbol, tf)] = rec
         return False
 
@@ -298,7 +365,7 @@ def _snapshot_stats():
 
 
 def log_signal(row):
-    """把信号写入 CSV 格式日志，方便后续统计胜率"""
+    """把信号写入 CSV 格式月份日志（v3.9 按月切）"""
     header = "time_utc,symbol,timeframe,sig_type,strength_stars,strength_ratio,price,fusion,flow,age_bars,bar_utc\n"
     line = (
         f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')},"
@@ -308,9 +375,10 @@ def log_signal(row):
         f"{row['age']},{row['bar_utc']}\n"
     )
     try:
+        log_path = _signals_log_path_for_now()
         with _log_lock:
-            exists = os.path.exists(SIGNALS_LOG_FILE)
-            with open(SIGNALS_LOG_FILE, "a", encoding="utf-8") as f:
+            exists = os.path.exists(log_path)
+            with open(log_path, "a", encoding="utf-8") as f:
                 if not exists:
                     f.write(header)
                 f.write(line)
@@ -759,13 +827,13 @@ def scan_markets(exchange, timeframe):
     try:
         all_symbols = get_top_symbols(exchange)
 
-        # 过滤出未冷藏的合约
+        # 过滤出未冷藏 / 未短期跳过的合约
         symbols = [s for s in all_symbols if not is_cold(s, timeframe)]
         skipped_cold = len(all_symbols) - len(symbols)
 
         total = len(symbols)
         fresh_bars = FRESH_BARS_MAP.get(timeframe, FRESH_BARS_DEFAULT)
-        extra = f" | 冷藏跳过:{skipped_cold}" if skipped_cold else ""
+        extra = f" | 退避跳过:{skipped_cold}" if skipped_cold else ""
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] [SCAN] 周期:{timeframe} | "
               f"合约:{total} | 并发:{SCAN_WORKERS} | 新鲜度≤{fresh_bars}{extra}")
 
@@ -795,9 +863,9 @@ def scan_markets(exchange, timeframe):
                     triggered = record_failure(sym, timeframe)
                     if triggered:
                         cold_count += 1
-                        tg_logs.append(f"  [COLD] {sym}: 连续失败，冷藏 1 小时 ({type(e).__name__})")
+                        tg_logs.append(f"  [COLD] {sym}: 连续失败 {FAIL_STRIKE_LIMIT} 次，冷藏 1 小时 ({type(e).__name__})")
                     else:
-                        tg_logs.append(f"  [SKIP] {sym}: {type(e).__name__}")
+                        tg_logs.append(f"  [SKIP] {sym}: {type(e).__name__}（短期跳过）")
 
                 # 进度条
                 alert_preview = len(high_tier_queue) + len(low_tier_queue)
@@ -850,7 +918,7 @@ def scan_markets(exchange, timeframe):
 
 
 # ==============================================================================
-# 10. 【监控：心跳 / 崩溃通知 / 每日日报】(v3.6 新增)
+# 10. 【监控：心跳 / 崩溃通知 / 每日日报】(v3.6 新增, v3.9 日报跨月合并)
 # ==============================================================================
 
 def _parse_log_row_from_line(line):
@@ -873,28 +941,36 @@ def _parse_log_row_from_line(line):
 
 
 def _read_signals_last_hours(hours):
-    """读取 signals.log 最近 N 小时的信号记录"""
-    if not os.path.exists(SIGNALS_LOG_FILE):
-        return []
-
+    """读取最近 N 小时的信号记录
+    v3.9: 按月切后，日报需要扫所有月份文件 + 旧的 signals.log（向后兼容）
+    （日报 24 小时窗口最多跨当月 + 上月两个文件）
+    """
     cutoff = datetime.now(timezone.utc).timestamp() - hours * 3600
     rows = []
-    try:
-        with open(SIGNALS_LOG_FILE, "r", encoding="utf-8") as f:
-            next(f, None)    # 跳过 header
-            for line in f:
-                row = _parse_log_row_from_line(line)
-                if not row:
-                    continue
-                try:
-                    t = datetime.strptime(row["time_utc"], "%Y-%m-%d %H:%M:%S") \
-                        .replace(tzinfo=timezone.utc).timestamp()
-                    if t >= cutoff:
-                        rows.append(row)
-                except ValueError:
-                    continue
-    except Exception as e:
-        print(f"  [WARN] 读取 signals.log 失败: {e}")
+
+    # 收集所有候选日志文件：当月 + 旧 signals.log + 任何 signals_*.log
+    candidates = []
+    if os.path.exists(SIGNALS_LOG_LEGACY):
+        candidates.append(SIGNALS_LOG_LEGACY)
+    candidates.extend(sorted(glob.glob(os.path.join(SIGNALS_LOG_DIR, "signals_*.log"))))
+
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                next(f, None)    # 跳过 header
+                for line in f:
+                    row = _parse_log_row_from_line(line)
+                    if not row:
+                        continue
+                    try:
+                        t = datetime.strptime(row["time_utc"], "%Y-%m-%d %H:%M:%S") \
+                            .replace(tzinfo=timezone.utc).timestamp()
+                        if t >= cutoff:
+                            rows.append(row)
+                    except ValueError:
+                        continue
+        except Exception as e:
+            print(f"  [WARN] 读取 {os.path.basename(path)} 失败: {e}")
     return rows
 
 
@@ -999,9 +1075,10 @@ def main():
         'apiKey':  BINANCE_API_KEY,
         'secret':  BINANCE_SECRET_KEY,
         'options': {'defaultType': 'future'},
-        'enableRateLimit': True
+        'enableRateLimit': True,
+        'timeout': CCXT_TIMEOUT_MS,    # v3.9: 单次 API 调用最多卡 10 秒
     })
-    print("[OK] 交易所初始化完成")
+    print(f"[OK] 交易所初始化完成（ccxt timeout={CCXT_TIMEOUT_MS}ms）")
 
     print("[INIT] 发送启动宣告至 Telegram...")
     fresh_desc = " / ".join(f"{tf}:{FRESH_BARS_MAP.get(tf, FRESH_BARS_DEFAULT)}根"
@@ -1009,19 +1086,19 @@ def main():
     interval_desc = " / ".join(f"{t['timeframe']}:{t['interval_minutes']}分"
                                for t in SCAN_TASKS)
     send_tg(
-        f"<b>Quantum Flow 背离侦察系统 v3.8 启动</b>\n"
+        f"<b>Quantum Flow 背离侦察系统 v3.9 启动</b>\n"
         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"监控周期: 15m / 1h / 4h\n"
         f"扫描频率: {interval_desc}\n"
         f"合约池: Binance USDT 永续 Top {TOP_N} (按 24h 成交额)\n"
-        f"并发扫描: {SCAN_WORKERS} 线程\n"
+        f"并发扫描: {SCAN_WORKERS} 线程 | API 超时: {CCXT_TIMEOUT_MS}ms\n"
         f"新鲜度: {fresh_desc}\n"
-        f"失败退避: 连续 {FAIL_STRIKE_LIMIT} 次 → 冷藏 {COOLDOWN_SECONDS // 60} 分钟\n"
+        f"失败退避: {FAIL_STRIKE_LIMIT-1} 次内短期跳过(最多5分) → {FAIL_STRIKE_LIMIT} 次冷藏 {COOLDOWN_SECONDS // 60} 分\n"
         f"推送分级: ≥ {MSG_TIER_STARS}★ 单独推 / &lt; {MSG_TIER_STARS}★ 合并摘要\n"
         f"机器人路由: 15m → 第一机器人 / 1h·4h·系统通知 → 默认机器人\n"
         f"监控: 💓 心跳每{HEARTBEAT_INTERVAL_HOURS}h / 📅 日报UTC 0点 / 🚨 崩溃自动通知\n"
         f"信号: Quantum/Flow 背离 (带强度星级)\n"
-        f"状态: 全市场扫描中..."
+        f"状态: 启动错峰中（30/45/60s 后首扫）..."
     )
 
     # v3.8 给每个非默认机器人也单独发一条"就位"消息，让用户能立刻确认它活着
@@ -1032,20 +1109,28 @@ def main():
             _seen_tokens.add(_tok)
             _style = TF_STYLE_MAP.get(_tf, TF_STYLE_DEFAULT)
             _band = _style.get("band", "⚪") * 10
+            _delay = STARTUP_FIRST_RUN_DELAYS.get(_tf, 30)
             send_tg(
                 f"{_band}\n"
                 f"{_style['emoji']} <b>[{_tf} 专用机器人] 就位</b>\n"
                 f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"职责: 推送 {_tf} 周期的所有背离信号\n"
-                f"状态: 等待第一轮扫描 (约 {next((t['interval_minutes'] for t in SCAN_TASKS if t['timeframe']==_tf), 3)} 分钟)...\n"
+                f"状态: 等待启动错峰首扫 (约 {_delay} 秒后)...\n"
                 f"{_band}",
                 timeframe=_tf
             )
 
-    # v3.4 启动首轮静默：用当前时间初始化，首次扫描会按正常节奏（等 interval_minutes 分钟后）触发
-    # 避免启动瞬间 3 个周期同时扫描、爆推一堆旧信号
+    # v3.9 启动错峰：首次扫描在 STARTUP_FIRST_RUN_DELAYS 秒后触发
+    # 实现方式：把 last_run_times 设到"过去"——当前时间 - (interval - delay)，
+    # 这样 main loop 里 (now - last_run_times[tf] >= interval_sec) 在 delay 秒后即满足。
+    # 比 v3.4/v3.8 哑静 31 分钟好得多，但仍避免启动瞬间三周期同时跑（错峰 30/45/60 秒）。
     _now_init = time.time()
-    last_run_times = {task['timeframe']: _now_init for task in SCAN_TASKS}
+    last_run_times = {}
+    for task in SCAN_TASKS:
+        tf = task['timeframe']
+        interval_sec = task['interval_minutes'] * 60
+        first_delay = STARTUP_FIRST_RUN_DELAYS.get(tf, 30)
+        last_run_times[tf] = _now_init - interval_sec + first_delay
 
     # v3.6 监控调度：
     # - 心跳：每 HEARTBEAT_INTERVAL_HOURS 小时一次，从启动时间开始算
@@ -1054,7 +1139,10 @@ def main():
     last_daily_date     = datetime.now(timezone.utc).date()   # 启动当天不发日报，避免重启刷屏
 
     print("\n" + "=" * 60)
-    print("  Quantum Flow 背离侦察系统 v3.8 部署成功")
+    print("  Quantum Flow 背离侦察系统 v3.9 部署成功")
+    print(f"  日志路径: {SIGNALS_LOG_DIR}")
+    print(f"  当月日志: {os.path.basename(_signals_log_path_for_now())}")
+    print(f"  去重缓存: {SENT_SIGNALS_FILE}")
     print("=" * 60 + "\n")
 
     while True:
