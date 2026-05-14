@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quantum Flow 背离侦察系统 v3.9
+Quantum Flow 背离侦察系统 v3.10
 - 按 Binance USDT 永续合约 24h 成交额降序取前 TOP_N 个扫描
 - 严格排除交割合约、USDC 计价合约
 - 并发扫描（线程池），单周期扫描提速 3~5 倍
@@ -23,6 +23,12 @@ Quantum Flow 背离侦察系统 v3.9
   ④ TG 锁按 token 拆分，多机器人推送可并行（推送速度 ~2x）
   ⑤ 失败合约短期跳过（1/2/3 分钟指数退避），三振才进 1 小时冷藏
   ⑥ 启动后 30/45/60 秒内三个周期分别跑一次，不再哑静 31 分钟
+- v3.10 Pine 对齐（让脚本数学严格 = TV 上你朋友写的 Quantum Flow Cipher）：
+  ① rolling.std() → std(ddof=0)：用总体标准差（÷N），对齐 Pine ta.stdev
+  ② ATR 平滑：rolling(14).mean() → ewm(α=1/14, adjust=False)，对齐 Pine ta.atr 的 RMA
+  ③ stdev 下界保护：.replace(0, 1e-6) → .clip(lower=1e-6)，对齐 Pine math.max(stdev, 1e-6)
+  这是有意"违反"核心算法不动的铁律——目的是让 Python 更忠实地复刻 Pine 真理源。
+  没有改信号语义，只是修正了 3 处微小的数学偏差（约 1~5%），降低边缘"幽灵背离"概率。
 """
 
 import ccxt
@@ -413,13 +419,14 @@ def calculate_quantum_flow(df):
     df['macd']    = df['ema12'] - df['ema26']
     df['macd_lr'] = df['macd'].ewm(span=3, adjust=False).mean()
 
-    # --- 归一化 ---
-    df['macd_std']  = df['macd_lr'].rolling(50).std().replace(0, 1e-6)
+    # --- 归一化（v3.10 Pine 对齐：std(ddof=0) 用总体标准差对齐 ta.stdev；
+    #     .clip(lower=1e-6) 对齐 Pine math.max(stdev, 1e-6) 的下界保护）---
+    df['macd_std']  = df['macd_lr'].rolling(50).std(ddof=0).clip(lower=1e-6)
     df['macd_norm'] = df['macd_lr'] / df['macd_std']
-    df['cvd_std']   = df['cvd_mom'].rolling(50).std().replace(0, 1e-6)
+    df['cvd_std']   = df['cvd_mom'].rolling(50).std(ddof=0).clip(lower=1e-6)
     df['cvd_norm']  = df['cvd_mom'] / df['cvd_std']
 
-    # --- ATR 波动率加权 ---
+    # --- ATR 波动率加权（v3.10 Pine 对齐：ATR 用 Wilder's RMA = EMA(α=1/14)，对齐 ta.atr）---
     df['tr'] = np.maximum(
         df['high'] - df['low'],
         np.maximum(
@@ -427,8 +434,8 @@ def calculate_quantum_flow(df):
             np.abs(df['low']  - df['close'].shift(1))
         )
     )
-    df['atr']       = df['tr'].rolling(14).mean()
-    df['atr_sma20'] = df['atr'].rolling(20).mean().replace(0, 1e-6)
+    df['atr']       = df['tr'].ewm(alpha=1/14, adjust=False).mean()    # v3.10: SMA(14) → RMA(14)
+    df['atr_sma20'] = df['atr'].rolling(20).mean().clip(lower=1e-6)    # v3.10: 同样改 clip
     df['vr']        = np.clip(df['atr'] / df['atr_sma20'], 0.7, 1.5)
     df['mw']        = (1 / df['vr']) / (1 / df['vr'] + df['vr'])
 
@@ -439,11 +446,11 @@ def calculate_quantum_flow(df):
     df['fusion_c'] = np.tanh(df['fusion_raw'] / 3.0) * 3.0
     df['fusion_d'] = df['fusion_c'] * 25.0
 
-    # --- Money Flow 柱 ---
+    # --- Money Flow 柱（v3.10 Pine 对齐：分母也用 clip(lower=1e-6)）---
     hlc3    = (df['high'] + df['low'] + df['close']) / 3
     mf_m    = hlc3.rolling(5).mean()
     diff    = hlc3 - mf_m
-    sma_abs = diff.abs().rolling(5).mean().replace(0, 1e-6)
+    sma_abs = diff.abs().rolling(5).mean().clip(lower=1e-6)
     df['mf'] = (diff / (0.015 * sma_abs)).rolling(60).mean()
 
     return df
@@ -1086,7 +1093,7 @@ def main():
     interval_desc = " / ".join(f"{t['timeframe']}:{t['interval_minutes']}分"
                                for t in SCAN_TASKS)
     send_tg(
-        f"<b>Quantum Flow 背离侦察系统 v3.9 启动</b>\n"
+        f"<b>Quantum Flow 背离侦察系统 v3.10 启动</b>\n"
         f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"监控周期: 15m / 1h / 4h\n"
         f"扫描频率: {interval_desc}\n"
@@ -1139,7 +1146,7 @@ def main():
     last_daily_date     = datetime.now(timezone.utc).date()   # 启动当天不发日报，避免重启刷屏
 
     print("\n" + "=" * 60)
-    print("  Quantum Flow 背离侦察系统 v3.9 部署成功")
+    print("  Quantum Flow 背离侦察系统 v3.10 部署成功")
     print(f"  日志路径: {SIGNALS_LOG_DIR}")
     print(f"  当月日志: {os.path.basename(_signals_log_path_for_now())}")
     print(f"  去重缓存: {SENT_SIGNALS_FILE}")

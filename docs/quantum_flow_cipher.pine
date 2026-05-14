@@ -1,0 +1,206 @@
+//@version=5
+// =============================================================================
+// 这是 Python 脚本（scanner.py）的真理源（source of truth）。
+// 用户朋友写的原版 Pine Script Quantum Flow Cipher 指标，在 TradingView 上运行。
+// scanner.py 的 calculate_quantum_flow / detect_pivots / detect_divergence_signals
+// 应该严格对齐这份代码。发现 Python 实现与本文件偏差 → 修 Python，不要改 Pine。
+//
+// 已确认对齐（v3.10 修正）：
+// - ta.stdev 用总体标准差（÷N） → pandas .std(ddof=0)
+// - ta.atr 用 Wilder's RMA（α=1/14） → pandas .ewm(alpha=1/14, adjust=False)
+// - math.max(stdev, 1e-6) → pandas .clip(lower=1e-6)
+//
+// 已知 Python 未实现（暂不需要）：
+// - Level3 吸筹/出货（基于连续大单 + 价格停滞）
+// - 双背离共振（用户主动禁用）
+//
+// 不会改：所有 input.* 输入参数（Pine UI 用，Python 直接硬编码常量）
+// =============================================================================
+indicator(title='Quantum Flow Cipher', overlay=false)
+
+// === 功能开关 ===
+g1 = "功能开关"
+show_mf   = input.bool(true,  "显示 Flow 柱",        group=g1)
+show_fus  = input.bool(true,  "显示 Quantum 主线",   group=g1)
+show_fdiv = input.bool(true,  "显示 Quantum 背离线", group=g1)
+show_mdiv = input.bool(true,  "显示 Flow 背离线",    group=g1)
+show_ddiv = input.bool(true,  "显示双背离信号",      group=g1)
+showL3    = input.bool(false, "显示 Level3 背景",    group=g1)
+
+// === Quantum 背离设置 ===
+g3 = "Quantum 背离设置"
+f_bear_col       = input.color(color.red,   "顶背离色", group=g3, inline="f")
+f_bull_col       = input.color(color.green, "底背离色", group=g3, inline="f")
+f_line_width     = input.int(2, "线宽", minval=1, maxval=4, group=g3, inline="fs")
+f_line_style_str = input.string("虚线", "线型", options=["实线", "虚线", "点线"], group=g3, inline="fs")
+
+// === Flow 背离设置 ===
+g4 = "Flow 背离设置"
+m_bear_col       = input.color(color.orange, "顶背离色", group=g4, inline="m")
+m_bull_col       = input.color(color.lime,   "底背离色", group=g4, inline="m")
+m_line_width     = input.int(2, "线宽", minval=1, maxval=4, group=g4, inline="ms")
+m_line_style_str = input.string("虚线", "线型", options=["实线", "虚线", "点线"], group=g4, inline="ms")
+
+// === 双背离信号 ===
+g5 = "双背离信号"
+hold_bars = input.int(8,  "信号保持周期", minval=1, maxval=50,  group=g5)
+gap_bars  = input.int(20, "最小间隔",     minval=5, maxval=100, group=g5)
+
+// === Quantum 参考线 ===
+g7 = "Quantum 参考线"
+show_ob = input.bool(true,   "显示参考线",      group=g7)
+fus_ob  = input.float( 60.0, "超买线", step=5.0, minval=10.0,  maxval=74.0,  group=g7)
+fus_os  = input.float(-60.0, "超卖线", step=5.0, minval=-74.0, maxval=-10.0, group=g7)
+
+// === Level3 ===
+g6 = "Level3"
+l3_len = input.int(2,     "连续强Delta", minval=2, maxval=10, group=g6)
+l3_str = input.float(1.5, "强Delta倍数", step=0.1, group=g6)
+l3_atr = input.float(0.5, "停滞ATR倍数", step=0.1, group=g6)
+
+// 内置参数
+f_pl = 5,  f_pr = 3, f_mb = 8,  f_md = 3.0
+m_pl = 10, m_pr = 6, m_mb = 20, m_md = 3.0
+
+// 工具函数
+f_lstyle(s) => s == "实线" ? line.style_solid : s == "点线" ? line.style_dotted : line.style_dashed
+f_tanh(x)   => e1 = math.exp(x), e2 = math.exp(-x), (e1-e2)/(e1+e2)
+
+// =======================
+// 计算
+// =======================
+deltaVol  = close > close[1] ? volume : close < close[1] ? -volume : 0
+cvd_mom   = ta.ema(ta.cum(deltaVol) - ta.cum(deltaVol)[3], 10)
+macd_lr   = ta.ema(ta.ema(close,12) - ta.ema(close,26), 3)
+macd_norm = macd_lr / math.max(ta.stdev(macd_lr, 50), 1e-6)
+cvd_norm  = cvd_mom / math.max(ta.stdev(cvd_mom, 50), 1e-6)
+
+atr_f = ta.atr(14)
+vr    = math.max(0.7, math.min(atr_f / math.max(ta.sma(atr_f,20), 1e-6), 1.5))
+mw    = (1/vr) / (1/vr + vr)
+
+fusion_c = f_tanh(ta.ema(macd_norm*mw + cvd_norm*(1-mw), 3) / 3.0) * 3.0
+fusion_d = fusion_c * 25.0
+fus_col  = math.abs(fusion_c - fusion_c[1]) < 0.05 ? color.gray : fusion_c > fusion_c[1] ? #089981 : #f23645
+
+mf_m = ta.sma(hlc3, 5)
+mf   = ta.sma((hlc3 - mf_m) / (0.015 * math.max(ta.sma(math.abs(hlc3-mf_m), 5), 1e-6)), 60)
+
+// =======================
+// 背离检测（通用逻辑）
+// =======================
+// Quantum 枢轴
+f_ph = ta.pivothigh(fusion_d, f_pl, f_pr)
+f_pl_p = ta.pivotlow(fusion_d, f_pl, f_pr)
+// Flow 枢轴
+m_ph = ta.pivothigh(mf, m_pl, m_pr)
+m_pl_p = ta.pivotlow(mf, m_pl, m_pr)
+
+var float fh_v = na, var float fh_p = na, var int fh_b = na
+var float fl_v = na, var float fl_p = na, var int fl_b = na
+var float mh_v = na, var float mh_p = na, var int mh_b = na
+var float ml_v = na, var float ml_p = na, var int ml_b = na
+var bool f_bull = false, var bool f_bear = false
+var bool m_bull = false, var bool m_bear = false
+var int  f_bl = 0, var int f_bh = 0
+var int  m_bl = 0, var int m_bh = 0
+
+f_bull := false, f_bear := false
+m_bull := false, m_bear := false
+
+// Quantum 顶背离
+if not na(f_ph)
+    pb = bar_index - f_pr
+    pv = f_ph
+    pp = high[f_pr]
+    if not na(fh_v) and not na(fh_b) and pp >= fh_p and fh_v - pv >= f_md and pb - fh_b >= f_mb
+        if show_fdiv
+            line.new(fh_b, fh_v, pb, pv, color=f_bear_col, width=f_line_width, style=f_lstyle(f_line_style_str))
+        f_bear := true
+    fh_v := pv, fh_p := pp, fh_b := pb
+
+// Quantum 底背离
+if not na(f_pl_p)
+    pb = bar_index - f_pr
+    pv = f_pl_p
+    pp = low[f_pr]
+    if not na(fl_v) and not na(fl_b) and pp <= fl_p and pv - fl_v >= f_md and pb - fl_b >= f_mb
+        if show_fdiv
+            line.new(fl_b, fl_v, pb, pv, color=f_bull_col, width=f_line_width, style=f_lstyle(f_line_style_str))
+        f_bull := true
+    fl_v := pv, fl_p := pp, fl_b := pb
+
+// Flow 顶背离
+if not na(m_ph)
+    pb = bar_index - m_pr
+    pv = m_ph
+    pp = high[m_pr]
+    hh = ta.highest(high, m_pl*3)
+    ll = ta.lowest(low,   m_pl*3)
+    if pp >= ll + (hh-ll)*0.5
+        if not na(mh_v) and not na(mh_b) and pp >= mh_p and mh_v - pv >= m_md and pb - mh_b >= m_mb
+            if show_mdiv
+                line.new(mh_b, mh_v, pb, pv, color=m_bear_col, width=m_line_width, style=f_lstyle(m_line_style_str))
+            m_bear := true
+    mh_v := pv, mh_p := pp, mh_b := pb
+
+// Flow 底背离
+if not na(m_pl_p)
+    pb = bar_index - m_pr
+    pv = m_pl_p
+    pp = low[m_pr]
+    hh = ta.highest(high, m_pl*3)
+    ll = ta.lowest(low,   m_pl*3)
+    if pp <= ll + (hh-ll)*0.5
+        if not na(ml_v) and not na(ml_b) and pp <= ml_p and pv - ml_v >= m_md and pb - ml_b >= m_mb
+            if show_mdiv
+                line.new(ml_b, ml_v, pb, pv, color=m_bull_col, width=m_line_width, style=f_lstyle(m_line_style_str))
+            m_bull := true
+    ml_v := pv, ml_p := pp, ml_b := pb
+
+// 信号保持
+f_bh := f_bear ? hold_bars : math.max(0, f_bh-1)
+f_bl := f_bull ? hold_bars : math.max(0, f_bl-1)
+m_bh := m_bear ? hold_bars : math.max(0, m_bh-1)
+m_bl := m_bull ? hold_bars : math.max(0, m_bl-1)
+
+// =======================
+// Level3 吸筹/出货（Python 暂未实现）
+// =======================
+avg_d = ta.sma(math.abs(deltaVol), 20)
+var int uc = 0, var int dc = 0
+uc    := deltaVol >  avg_d*l3_str ? uc+1 : 0
+dc    := deltaVol < -avg_d*l3_str ? dc+1 : 0
+stall  = math.abs(close - close[l3_len]) < atr_f*l3_atr
+fBull  = showL3 and dc >= l3_len and stall
+fBear  = showL3 and uc >= l3_len and stall
+
+// =======================
+// 双背离共振（Python 已主动禁用）
+// =======================
+var int dlb = 0, var int dbb = 0
+dbl_bull = show_ddiv and f_bl > 0 and m_bl > 0 and bar_index - dlb >= gap_bars
+dbl_bear = show_ddiv and f_bh > 0 and m_bh > 0 and bar_index - dbb >= gap_bars
+if dbl_bull
+    dlb := bar_index
+if dbl_bear
+    dbb := bar_index
+
+// =======================
+// 绘制
+// =======================
+mf_disp  = show_mf  ? display.all : display.none
+fus_disp = show_fus ? display.all : display.none
+
+hline(show_ob ? fus_ob : na, "超买区", color=color.new(color.red,   55), linestyle=hline.style_dashed, linewidth=1)
+hline(show_ob ? fus_os : na, "超卖区", color=color.new(color.green, 55), linestyle=hline.style_dashed, linewidth=1)
+
+plot(mf,       "Flow Bars",    mf > 0 ? #089981 : #f23645, style=plot.style_columns, histbase=0, display=mf_disp)
+plot(fusion_d, "Quantum Line", fus_col, linewidth=2, display=fus_disp)
+plot(0,        "Zero",         color.new(#ffffff, 0), linewidth=1)
+
+plotshape(dbl_bull ? fusion_d - 7.5 : na, "双底背离共振", shape.circle, location.absolute, color.new(color.green, 0), size=size.small)
+plotshape(dbl_bear ? fusion_d + 7.5 : na, "双顶背离共振", shape.circle, location.absolute, color.new(color.red,   0), size=size.small)
+
+bgcolor(fBull ? color.new(color.green, 85) : na, title="Level3 吸筹")
+bgcolor(fBear ? color.new(color.red,   85) : na, title="Level3 出货")
