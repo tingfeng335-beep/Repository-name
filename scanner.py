@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Quantum Flow 背离侦察系统 v3.10
+Quantum Flow 背离侦察系统 v3.11
 - 按 Binance USDT 永续合约 24h 成交额降序取前 TOP_N 个扫描
 - 严格排除交割合约、USDC 计价合约
 - 并发扫描（线程池），单周期扫描提速 3~5 倍
@@ -29,6 +29,7 @@ Quantum Flow 背离侦察系统 v3.10
   ③ stdev 下界保护：.replace(0, 1e-6) → .clip(lower=1e-6)，对齐 Pine math.max(stdev, 1e-6)
   这是有意"违反"核心算法不动的铁律——目的是让 Python 更忠实地复刻 Pine 真理源。
   没有改信号语义，只是修正了 3 处微小的数学偏差（约 1~5%），降低边缘"幽灵背离"概率。
+- v3.11 4h 信号增量: K 线 500 → 1000，4h 历史窗口 73 天 → 156 天
 """
 
 import ccxt
@@ -811,7 +812,8 @@ def _scan_one(exchange, symbol, timeframe):
     """
     # v3.7 拉 500 根 K（原 200）：让 rolling(50).std / rolling(60).mean / ewm 充分预热
     # 修幽灵背离：避免在 fusion_d/mf 还不稳定的前 60 根里找到"假枢轴"
-    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=500)
+    # v3.11: 500 → 1000，让 4h 历史窗口翻倍（73 天 → 156 天）
+    bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=1000)
     if len(bars) < 200:
         return symbol, []
 
